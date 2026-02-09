@@ -1,6 +1,14 @@
 # Test / scratch video files
 *.mp4
 
+# Model weights (large binary files — do NOT commit)
+weights/*.pt
+weights/*.pth
+weights/*.ckpt
+
+# Debug output images
+output_debug*.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

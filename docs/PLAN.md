@@ -5,8 +5,9 @@
 - [x] **Step 0** — Repo scaffold (`pyproject.toml`, `configs/`, `scripts/run_video.py`, project layout)
 - [x] **Step 1** — Video I/O + deterministic frame loop (`VideoReader`, `VideoWriter`, frame-index overlay)
 - [x] **Step 2A** — Calibrator interface + dummy wiring (`CourtCalibrator` ABC, `DummyCalibrator`, `--calibrator` flag)
-- [ ] **Step 2B** — Ad representation + placement spec
-- [ ] **Step 3** — CourtCalibrator v1 (TennisCourtDetector wrapper)
+- [x] **Step 2B** — Single-image calibrator proof (TennisCourtDetector wrapper + debug script)
+- [ ] **Step 2C** — Ad representation + placement spec
+- [ ] **Step 3** — Wire TennisCourtDetectorCalibrator into run_video.py for video processing
 - [ ] **Step 4** — Temporal stabilizer for homography
 - [ ] **Step 5** — Ad warp + naive composite
 - [ ] **Step 6** — OcclusionMasker v1 (players only)
@@ -186,6 +187,50 @@ Implement:
   * `--resize` option
 
 **Done:** Can copy input→output video, and optionally overlay frame index.
+
+---
+
+### Step 2B — Single-image calibrator proof (completed)
+
+**Goal:** Prove the TennisCourtDetector model works end-to-end on a single image.
+
+**What was implemented:**
+
+* `TennisCourtDetectorCalibrator` — wraps BallTrackerNet (14-keypoint heatmap
+  model) behind the `CourtCalibrator` interface.
+* `scripts/debug_calibrator_image.py` — CLI to run calibration on one image
+  and save annotated output.
+* Vendored court reference + homography logic in `_tcd_adapted/` subpackage
+  (stripped unused matplotlib/scipy/sympy dependencies).
+* BallTrackerNet model imported via `importlib` from sibling
+  `TennisCourtDetector/` repo (no `sys.path` pollution).
+
+**Weights:**
+
+* Download from: <https://drive.google.com/file/d/1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG>
+* Place at: `weights/tennis_court_detector.pt`
+* Weights are git-ignored (large binary).
+
+**Run command:**
+
+```bash
+uv run python scripts/debug_calibrator_image.py \
+    --image_path ../tennis_court_detection/test_images/tennis_pic_01.png \
+    --output_path output_debug.png
+```
+
+**Dependencies (one-time install):**
+
+```bash
+uv pip install torch
+```
+
+**Known limitations:**
+
+* Only tested on behind-baseline broadcast angles (model training data).
+* No `refine_kps` postprocessing (would need sympy; deferred to later task).
+* No video processing yet — single image only.
+* No temporal stabilisation.
 
 ---
 
