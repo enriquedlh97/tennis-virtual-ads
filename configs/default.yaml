@@ -1,0 +1,13 @@
+# ---------------------------------------------------------------------------
+# Default configuration for scripts/run_video.py
+# CLI arguments override these values.
+# ---------------------------------------------------------------------------
+
+# Frame selection
+start_frame: 0
+max_frames: null      # null → process all frames
+stride: 1
+
+# Output resolution (null → keep original)
+# Format: "WIDTHxHEIGHT", e.g. "1280x720" or "640x360"
+resize: null
