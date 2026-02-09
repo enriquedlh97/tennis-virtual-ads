@@ -1,3 +1,6 @@
+# Test / scratch video files
+*.mp4
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

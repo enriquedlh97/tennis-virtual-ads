@@ -3,7 +3,7 @@
 Virtual advertisement overlay for tennis broadcasts.
 Takes a broadcast video, estimates court geometry, and composites an ad onto the court surface — with player occlusion so the result looks natural.
 
-> **Status:** Step 0/1 complete — scaffold + video I/O entrypoint.
+> **Status:** Steps 0 / 1 / 2A complete — scaffold, video I/O, calibrator interface + dummy wiring. See [docs/PLAN.md](docs/PLAN.md) for full progress.
 
 ---
 
@@ -47,7 +47,7 @@ bash scripts/setup_ec2.sh
 
 This installs:
 - Git config (author name/email) + vim + terminal prompt with git branch
-- System packages (`libgl1`, `libsm6`, `libxrender1` for OpenCV)
+- System packages (`ffmpeg`, `libgl1`, `libsm6`, `libxrender1` for OpenCV + video encoding)
 - NVIDIA driver 570 (for T4 GPU)
 - `uv` (Python package manager)
 - Sibling repos (`CourtCheck`, `tennis_court_detection`, `tennis-court-tracker`, `TennisCourtDetector`)
@@ -98,7 +98,14 @@ uv run python scripts/run_video.py path/to/input.mp4 output.mp4
 
 Reads `input.mp4`, overlays the frame index on every frame, and writes `output.mp4`.
 
-### 3. Useful flags
+### 3. Run with a calibrator
+
+```bash
+# Dummy calibrator — overlays "CALIB: dummy conf=0.00" (no ML, just wiring)
+uv run python scripts/run_video.py input.mp4 output.mp4 --calibrator dummy
+```
+
+### 4. Useful flags
 
 ```bash
 # First 200 frames, starting at frame 500, every 2nd frame
@@ -107,11 +114,15 @@ uv run python scripts/run_video.py input.mp4 output.mp4 \
     --max_frames 200 \
     --stride 2
 
-# Downscale to 640×360 for faster iteration
+# Downscale to 640x360 for faster iteration
 uv run python scripts/run_video.py input.mp4 output.mp4 --resize 640x360
+
+# Combine: dummy calibrator + limited frames + resize
+uv run python scripts/run_video.py input.mp4 output.mp4 \
+    --calibrator dummy --max_frames 100 --resize 640x360
 ```
 
-### 4. Dev commands
+### 5. Dev commands
 
 ```bash
 uv run pytest tests/ -v              # Run tests
@@ -129,6 +140,8 @@ uv run pre-commit run --all-files    # Run all pre-commit hooks
 tennis-virtual-ads/
 ├── configs/
 │   └── default.yaml                # Default CLI flag values
+├── docs/
+│   └── PLAN.md                     # Full plan + progress checklist
 ├── scripts/
 │   ├── run_video.py                # CLI entrypoint
 │   ├── setup_ec2.sh                # EC2 setup — phase 1 (pre-reboot)
@@ -139,7 +152,10 @@ tennis-virtual-ads/
 ├── src/tennis_virtual_ads/
 │   ├── io/
 │   │   └── video.py                # VideoReader / VideoWriter
-│   ├── pipeline/                   # (future) calibrators, maskers, placer, compositor
+│   ├── pipeline/
+│   │   └── calibrators/            # Court calibration interface + implementations
+│   │       ├── base.py             # CourtCalibrator ABC + CalibrationResult TypedDict
+│   │       └── dummy.py            # DummyCalibrator (H=None, conf=0.0 always)
 │   └── utils/                      # (future) geometry, drawing, config helpers
 ├── tests/
 │   └── test_smoke.py               # Smoke tests
@@ -151,9 +167,9 @@ tennis-virtual-ads/
 
 ---
 
-## Architecture (coming next)
+## Architecture
 
-See [PLAN.md](PLAN.md) for the full pipeline design:
+See [docs/PLAN.md](docs/PLAN.md) for the full pipeline design and progress checklist:
 
 - **CourtCalibrator** — homography estimation per frame
 - **OcclusionMasker** — player / foreground segmentation

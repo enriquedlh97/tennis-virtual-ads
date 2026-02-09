@@ -11,3 +11,7 @@ stride: 1
 # Output resolution (null → keep original)
 # Format: "WIDTHxHEIGHT", e.g. "1280x720" or "640x360"
 resize: null
+
+# Court calibrator (null → no calibration overlay)
+# Options: "dummy"
+calibrator: null

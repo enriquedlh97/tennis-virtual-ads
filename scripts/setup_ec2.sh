@@ -101,6 +101,7 @@ info "3/6  Installing system packages"
 sudo apt update -y
 sudo apt install -y \
     build-essential \
+    ffmpeg \
     libgl1 \
     libsm6 \
     libxrender1 \

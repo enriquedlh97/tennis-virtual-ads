@@ -5,6 +5,7 @@ Usage
 -----
     python scripts/run_video.py input.mp4 output.mp4
     python scripts/run_video.py input.mp4 output.mp4 --max_frames 300 --resize 640x360
+    python scripts/run_video.py input.mp4 output.mp4 --calibrator dummy
 
 Config defaults are loaded from ``configs/default.yaml``; any CLI flag
 overrides the corresponding config value.
@@ -30,6 +31,8 @@ _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
 from tennis_virtual_ads.io.video import VideoReader, VideoWriter  # noqa: E402
+from tennis_virtual_ads.pipeline.calibrators.base import CourtCalibrator  # noqa: E402
+from tennis_virtual_ads.pipeline.calibrators.dummy import DummyCalibrator  # noqa: E402
 
 logger = logging.getLogger("run_video")
 
@@ -98,6 +101,64 @@ def overlay_frame_index(frame: np.ndarray, frame_index: int) -> None:
     )
 
 
+def overlay_calibration_info(
+    frame: np.ndarray,
+    calibrator_name: str,
+    confidence: float,
+) -> None:
+    """Draw calibration info text below the frame index (mutates in-place)."""
+    text = f"CALIB: {calibrator_name} conf={confidence:.2f}"
+    _frame_height, frame_width = frame.shape[:2]
+
+    font_scale = max(0.5, frame_width / 1280.0)
+    thickness = max(1, int(font_scale * 2))
+    # Position below the frame-index line (offset down by ~40 scaled px)
+    position = (10, 30 + int(font_scale * 10) + int(font_scale * 30))
+
+    # Black outline for contrast, then green fill
+    cv2.putText(
+        frame,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (0, 0, 0),
+        thickness + 2,
+        cv2.LINE_AA,
+    )
+    cv2.putText(
+        frame,
+        text,
+        position,
+        cv2.FONT_HERSHEY_SIMPLEX,
+        font_scale,
+        (0, 255, 0),
+        thickness,
+        cv2.LINE_AA,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Calibrator factory
+# ---------------------------------------------------------------------------
+
+CALIBRATOR_REGISTRY: dict[str, type[CourtCalibrator]] = {
+    "dummy": DummyCalibrator,
+}
+
+
+def create_calibrator(name: str) -> CourtCalibrator:
+    """Instantiate a calibrator by its registered name.
+
+    Raises ``ValueError`` if *name* is not in the registry.
+    """
+    calibrator_class = CALIBRATOR_REGISTRY.get(name)
+    if calibrator_class is None:
+        valid_names = ", ".join(sorted(CALIBRATOR_REGISTRY.keys()))
+        raise ValueError(f"Unknown calibrator '{name}'. Available: {valid_names}")
+    return calibrator_class()
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -136,6 +197,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Resize frames to WIDTHxHEIGHT, e.g. '1280x720' (default: original)",
+    )
+    parser.add_argument(
+        "--calibrator",
+        type=str,
+        default=None,
+        choices=list(CALIBRATOR_REGISTRY.keys()),
+        help="Court calibrator to use (default: none)",
     )
     parser.add_argument(
         "--config",
@@ -178,12 +246,22 @@ def main() -> None:
     )
     resize: tuple[int, int] | None = parse_resize(resize_string)
 
+    # --- Calibrator --------------------------------------------------------
+    calibrator_name: str | None = (
+        args.calibrator if args.calibrator is not None else config.get("calibrator", None)
+    )
+    calibrator: CourtCalibrator | None = None
+    if calibrator_name is not None:
+        calibrator = create_calibrator(calibrator_name)
+        logger.info("Using calibrator: %s", calibrator_name)
+
     logger.info(
-        "Settings — start_frame=%d  max_frames=%s  stride=%d  resize=%s",
+        "Settings — start_frame=%d  max_frames=%s  stride=%d  resize=%s  calibrator=%s",
         start_frame,
         max_frames,
         stride,
         resize,
+        calibrator_name,
     )
 
     # --- Process video ----------------------------------------------------
@@ -207,6 +285,15 @@ def main() -> None:
         ) as writer:
             for frame_index, frame in reader:
                 overlay_frame_index(frame, frame_index)
+
+                if calibrator is not None:
+                    calibration_result = calibrator.estimate(frame)
+                    overlay_calibration_info(
+                        frame,
+                        calibrator_name,  # type: ignore[arg-type]
+                        calibration_result["conf"],
+                    )
+
                 writer.write(frame)
 
                 if writer.frames_written % 100 == 0:
