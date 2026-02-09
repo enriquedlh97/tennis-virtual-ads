@@ -189,7 +189,8 @@ class VideoWriter:
     height : int
         Frame height in pixels.
     codec : str
-        FourCC codec string.  Default ``"mp4v"`` for broad compatibility.
+        FourCC codec string.  Default ``"mp4v"`` which works everywhere.
+        The output can be re-encoded to H.264 via :func:`reencode_to_h264`.
     """
 
     def __init__(
@@ -263,3 +264,69 @@ class VideoWriter:
             )
         self._writer.write(frame)
         self._frames_written += 1
+
+
+# ---------------------------------------------------------------------------
+# Post-processing helper
+# ---------------------------------------------------------------------------
+
+
+def reencode_to_h264(video_path: str) -> bool:
+    """Re-encode a video file to H.264 using ffmpeg (in-place).
+
+    This is needed because OpenCV's ``mp4v`` codec produces files that
+    many browsers and media players cannot play.  If ``ffmpeg`` is
+    available on the system, this replaces the file with an H.264 version.
+
+    Parameters
+    ----------
+    video_path : str
+        Path to the video file to re-encode.
+
+    Returns
+    -------
+    bool
+        ``True`` if re-encoding succeeded, ``False`` if ffmpeg is not
+        available or the re-encode failed (original file is preserved).
+    """
+    import os
+    import shutil
+    import subprocess
+
+    if shutil.which("ffmpeg") is None:
+        logger.warning(
+            "ffmpeg not found on PATH; output video may not play in "
+            "all media players.  Install ffmpeg or re-encode manually."
+        )
+        return False
+
+    temp_path = video_path + ".h264.tmp.mp4"
+    try:
+        subprocess.run(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                video_path,
+                "-c:v",
+                "libx264",
+                "-crf",
+                "23",
+                "-preset",
+                "fast",
+                "-movflags",
+                "+faststart",
+                "-an",  # no audio (our videos have none)
+                temp_path,
+            ],
+            check=True,
+            capture_output=True,
+        )
+        os.replace(temp_path, video_path)
+        logger.info("Re-encoded to H.264: %s", video_path)
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.warning("ffmpeg re-encode failed: %s", exc.stderr.decode()[-200:])
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
+        return False

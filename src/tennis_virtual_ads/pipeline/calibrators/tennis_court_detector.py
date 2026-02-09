@@ -340,3 +340,34 @@ class TennisCourtDetectorCalibrator(CourtCalibrator):
     def court_reference(self) -> CourtReference:
         """Expose the court reference for overlay drawing."""
         return self._court_reference
+
+    @property
+    def court_line_segments(
+        self,
+    ) -> list[tuple[tuple[int, int], tuple[int, int]]]:
+        """All 10 court line segments as ``((x1,y1), (x2,y2))`` pairs.
+
+        Coordinates are in the court reference system.  Project through
+        the homography ``H`` to get image coordinates.
+        """
+        court_ref = self._court_reference
+        return [
+            court_ref.baseline_top,
+            court_ref.baseline_bottom,
+            court_ref.net,
+            court_ref.left_court_line,
+            court_ref.right_court_line,
+            court_ref.left_inner_line,
+            court_ref.right_inner_line,
+            court_ref.middle_line,
+            court_ref.top_inner_line,
+            court_ref.bottom_inner_line,
+        ]
+
+    @property
+    def reference_keypoints(self) -> np.ndarray:
+        """Reference keypoints as ``(14, 1, 2)`` array.
+
+        Suitable for ``cv2.perspectiveTransform(reference_keypoints, H)``.
+        """
+        return refer_kps

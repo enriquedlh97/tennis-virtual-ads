@@ -6,8 +6,8 @@
 - [x] **Step 1** — Video I/O + deterministic frame loop (`VideoReader`, `VideoWriter`, frame-index overlay)
 - [x] **Step 2A** — Calibrator interface + dummy wiring (`CourtCalibrator` ABC, `DummyCalibrator`, `--calibrator` flag)
 - [x] **Step 2B** — Single-image calibrator proof (TennisCourtDetector wrapper + debug script)
-- [ ] **Step 2C** — Ad representation + placement spec
-- [ ] **Step 3** — Wire TennisCourtDetectorCalibrator into run_video.py for video processing
+- [x] **Step 2C** — Video integration (calibrator in run_video.py, court overlay per frame)
+- [ ] **Step 2D** — Ad representation + placement spec
 - [ ] **Step 4** — Temporal stabilizer for homography
 - [ ] **Step 5** — Ad warp + naive composite
 - [ ] **Step 6** — OcclusionMasker v1 (players only)
@@ -187,6 +187,40 @@ Implement:
   * `--resize` option
 
 **Done:** Can copy input→output video, and optionally overlay frame index.
+
+---
+
+### Step 2C — Video integration (completed)
+
+**Goal:** Run TennisCourtDetectorCalibrator on every frame of a video and
+produce an output with court overlay.
+
+**What was implemented:**
+
+* `run_video.py` extended with `--calibrator tennis_court_detector`,
+  `--weights_path`, `--calib_conf_threshold`, `--draw_mode {overlay,keypoints,none}`.
+* Per-frame status HUD: "CALIB OK conf=... kp=N/14 err=...px" (green) or
+  "NO CALIB conf=... kp=N/14" (red).
+* Shared drawing module `src/tennis_virtual_ads/utils/draw.py` -- extracted
+  from debug_calibrator_image.py so both scripts reuse the same helpers.
+* Lazy calibrator import: torch is only loaded when `--calibrator tennis_court_detector`
+  is selected.
+* End-of-run stats: accepted/rejected frame counts and accept rate.
+
+**Run command:**
+
+```bash
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_overlay.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay
+```
+
+**Known limitations:**
+
+* No temporal smoothing -- overlay may "swim" frame-to-frame.
+* No scene-cut detection -- if the camera changes, stale H may flash briefly.
+* CPU-only inference is slow (~1-3 fps); GPU speeds this up significantly.
 
 ---
 

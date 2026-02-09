@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
-"""CLI entrypoint — read a video, overlay frame indices, write output.
+"""CLI entrypoint -- read a video, run court calibration, write output.
 
 Usage
 -----
+    # Passthrough (no calibration):
     python scripts/run_video.py input.mp4 output.mp4
-    python scripts/run_video.py input.mp4 output.mp4 --max_frames 300 --resize 640x360
+
+    # With dummy calibrator:
     python scripts/run_video.py input.mp4 output.mp4 --calibrator dummy
+
+    # With TennisCourtDetector calibrator + court overlay:
+    python scripts/run_video.py input.mp4 output.mp4 \\
+        --calibrator tennis_court_detector \\
+        --draw_mode overlay
+
+    # Quick dev run (every 3rd frame, first 100 frames):
+    python scripts/run_video.py input.mp4 output.mp4 \\
+        --calibrator tennis_court_detector \\
+        --stride 3 --max_frames 100
 
 Config defaults are loaded from ``configs/default.yaml``; any CLI flag
 overrides the corresponding config value.
@@ -20,7 +32,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-import cv2
 import numpy as np
 import yaml
 
@@ -30,9 +41,19 @@ import yaml
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_PROJECT_ROOT / "src"))
 
-from tennis_virtual_ads.io.video import VideoReader, VideoWriter  # noqa: E402
-from tennis_virtual_ads.pipeline.calibrators.base import CourtCalibrator  # noqa: E402
+from tennis_virtual_ads.io.video import VideoReader, VideoWriter, reencode_to_h264  # noqa: E402
+from tennis_virtual_ads.pipeline.calibrators.base import (  # noqa: E402
+    CalibrationResult,
+    CourtCalibrator,
+)
 from tennis_virtual_ads.pipeline.calibrators.dummy import DummyCalibrator  # noqa: E402
+from tennis_virtual_ads.utils.draw import (  # noqa: E402
+    STATUS_FAIL_COLOR,
+    STATUS_OK_COLOR,
+    draw_keypoints,
+    draw_projected_lines,
+    overlay_text_with_outline,
+)
 
 logger = logging.getLogger("run_video")
 
@@ -49,7 +70,7 @@ def load_config(config_path: Path) -> dict[str, Any]:
     if config_path.exists():
         with open(config_path) as config_file:
             return yaml.safe_load(config_file) or {}
-    logger.warning("Config file not found: %s — using built-in defaults.", config_path)
+    logger.warning("Config file not found: %s -- using built-in defaults.", config_path)
     return {}
 
 
@@ -68,95 +89,100 @@ def parse_resize(value: str | None) -> tuple[int, int] | None:
     return int(parts[0]), int(parts[1])
 
 
+# ---------------------------------------------------------------------------
+# HUD overlay helpers (frame index + calibration status)
+# ---------------------------------------------------------------------------
+
+
+def _compute_font_metrics(frame_width: int) -> tuple[float, int, int]:
+    """Return ``(font_scale, thickness, line_height)`` scaled to frame width."""
+    font_scale = max(0.5, frame_width / 1280.0)
+    thickness = max(1, int(font_scale * 2))
+    line_height = int(30 + font_scale * 10)
+    return font_scale, thickness, line_height
+
+
 def overlay_frame_index(frame: np.ndarray, frame_index: int) -> None:
     """Draw the frame index onto the top-left of *frame* (mutates in-place)."""
-    text = f"Frame {frame_index}"
     _frame_height, frame_width = frame.shape[:2]
-
-    # Scale font relative to frame width so text is readable at any resolution
-    font_scale = max(0.5, frame_width / 1280.0)
-    thickness = max(1, int(font_scale * 2))
-    position = (10, 30 + int(font_scale * 10))
-
-    # Black outline for contrast, then white fill
-    cv2.putText(
-        frame,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        (0, 0, 0),
-        thickness + 2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        (255, 255, 255),
-        thickness,
-        cv2.LINE_AA,
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height)
+    overlay_text_with_outline(
+        frame, f"Frame {frame_index}", position, font_scale, (255, 255, 255), thickness
     )
 
 
-def overlay_calibration_info(
+def overlay_calibration_status(
     frame: np.ndarray,
-    calibrator_name: str,
-    confidence: float,
+    result: CalibrationResult,
+    is_accepted: bool,
 ) -> None:
-    """Draw calibration info text below the frame index (mutates in-place)."""
-    text = f"CALIB: {calibrator_name} conf={confidence:.2f}"
+    """Draw calibration status text below the frame index.
+
+    Shows either:
+    - ``"CALIB OK conf=0.86 kp=12/14 err=5.2px"`` (green)
+    - ``"NO CALIB conf=0.21 kp=3/14"`` (red)
+
+    Mutates *frame* in-place.
+    """
     _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30))
 
-    font_scale = max(0.5, frame_width / 1280.0)
-    thickness = max(1, int(font_scale * 2))
-    # Position below the frame-index line (offset down by ~40 scaled px)
-    position = (10, 30 + int(font_scale * 10) + int(font_scale * 30))
+    debug = result["debug"]
+    detected_count = debug.get("detected_keypoint_count", 0)
+    total_keypoints = debug.get("total_keypoints", 14)
+    reprojection_error = debug.get("reprojection_error_px")
 
-    # Black outline for contrast, then green fill
-    cv2.putText(
-        frame,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        (0, 0, 0),
-        thickness + 2,
-        cv2.LINE_AA,
-    )
-    cv2.putText(
-        frame,
-        text,
-        position,
-        cv2.FONT_HERSHEY_SIMPLEX,
-        font_scale,
-        (0, 255, 0),
-        thickness,
-        cv2.LINE_AA,
-    )
+    if is_accepted:
+        error_part = f" err={reprojection_error:.1f}px" if reprojection_error is not None else ""
+        text = (
+            f"CALIB OK conf={result['conf']:.2f} kp={detected_count}/{total_keypoints}{error_part}"
+        )
+        color = STATUS_OK_COLOR
+    else:
+        text = f"NO CALIB conf={result['conf']:.2f} kp={detected_count}/{total_keypoints}"
+        color = STATUS_FAIL_COLOR
+
+    overlay_text_with_outline(frame, text, position, font_scale, color, thickness)
 
 
 # ---------------------------------------------------------------------------
 # Calibrator factory
 # ---------------------------------------------------------------------------
 
-CALIBRATOR_REGISTRY: dict[str, type[CourtCalibrator]] = {
-    "dummy": DummyCalibrator,
-}
+CALIBRATOR_NAMES: list[str] = ["dummy", "tennis_court_detector"]
 
 
-def create_calibrator(name: str) -> CourtCalibrator:
+def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
     """Instantiate a calibrator by its registered name.
 
-    Raises ``ValueError`` if *name* is not in the registry.
+    Parameters
+    ----------
+    name : str
+        One of the values in :data:`CALIBRATOR_NAMES`.
+    **kwargs
+        Forwarded to the calibrator constructor (e.g. ``weights_path``).
+
+    Raises
+    ------
+    ValueError
+        If *name* is not recognised.
     """
-    calibrator_class = CALIBRATOR_REGISTRY.get(name)
-    if calibrator_class is None:
-        valid_names = ", ".join(sorted(CALIBRATOR_REGISTRY.keys()))
-        raise ValueError(f"Unknown calibrator '{name}'. Available: {valid_names}")
-    return calibrator_class()
+    if name == "dummy":
+        return DummyCalibrator()
+
+    if name == "tennis_court_detector":
+        # Lazy import so torch is only loaded when this calibrator is selected.
+        from tennis_virtual_ads.pipeline.calibrators.tennis_court_detector import (
+            TennisCourtDetectorCalibrator,
+        )
+
+        weights_path = kwargs.get("weights_path", "weights/tennis_court_detector.pt")
+        return TennisCourtDetectorCalibrator(weights_path=weights_path)
+
+    valid_names = ", ".join(sorted(CALIBRATOR_NAMES))
+    raise ValueError(f"Unknown calibrator '{name}'. Available: {valid_names}")
 
 
 # ---------------------------------------------------------------------------
@@ -168,12 +194,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """Build and return the CLI argument parser."""
     parser = argparse.ArgumentParser(
         description=(
-            "Tennis Virtual Ads — Video I/O scaffold.  "
-            "Reads a video, overlays frame indices, writes output."
+            "Tennis Virtual Ads -- process a video with court calibration "
+            "and optional overlay drawing."
         ),
     )
     parser.add_argument("input", help="Path to input video file (e.g. match.mp4)")
     parser.add_argument("output", help="Path to output video file (e.g. output.mp4)")
+
+    # --- Frame selection --------------------------------------------------
     parser.add_argument(
         "--max_frames",
         type=int,
@@ -198,13 +226,42 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Resize frames to WIDTHxHEIGHT, e.g. '1280x720' (default: original)",
     )
+
+    # --- Calibration ------------------------------------------------------
     parser.add_argument(
         "--calibrator",
         type=str,
         default=None,
-        choices=list(CALIBRATOR_REGISTRY.keys()),
+        choices=CALIBRATOR_NAMES,
         help="Court calibrator to use (default: none)",
     )
+    parser.add_argument(
+        "--weights_path",
+        type=str,
+        default=None,
+        help=("Path to calibrator model weights (default: weights/tennis_court_detector.pt)"),
+    )
+    parser.add_argument(
+        "--calib_conf_threshold",
+        type=float,
+        default=0.30,
+        help=(
+            "Minimum confidence to accept a calibration result and draw the overlay (default: 0.30)"
+        ),
+    )
+    parser.add_argument(
+        "--draw_mode",
+        type=str,
+        choices=["overlay", "keypoints", "none"],
+        default="overlay",
+        help=(
+            "Drawing mode: 'overlay' projects court lines when calibration "
+            "succeeds; 'keypoints' draws detected keypoints; 'none' draws "
+            "only status text (default: overlay)"
+        ),
+    )
+
+    # --- Config -----------------------------------------------------------
     parser.add_argument(
         "--config",
         type=str,
@@ -246,26 +303,44 @@ def main() -> None:
     )
     resize: tuple[int, int] | None = parse_resize(resize_string)
 
+    draw_mode: str = args.draw_mode
+    calib_conf_threshold: float = args.calib_conf_threshold
+
     # --- Calibrator --------------------------------------------------------
     calibrator_name: str | None = (
         args.calibrator if args.calibrator is not None else config.get("calibrator", None)
     )
     calibrator: CourtCalibrator | None = None
+    # Properties used for drawing (only available on TennisCourtDetectorCalibrator).
+    calibrator_court_lines: list[tuple[tuple[int, int], tuple[int, int]]] | None = None
+
     if calibrator_name is not None:
-        calibrator = create_calibrator(calibrator_name)
+        calibrator_kwargs: dict[str, Any] = {}
+        if args.weights_path is not None:
+            calibrator_kwargs["weights_path"] = args.weights_path
+        calibrator = create_calibrator(calibrator_name, **calibrator_kwargs)
         logger.info("Using calibrator: %s", calibrator_name)
 
+        # Grab court line segments if the calibrator exposes them.
+        if hasattr(calibrator, "court_line_segments"):
+            calibrator_court_lines = calibrator.court_line_segments
+
     logger.info(
-        "Settings — start_frame=%d  max_frames=%s  stride=%d  resize=%s  calibrator=%s",
+        "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
+        "calibrator=%s  draw_mode=%s  conf_threshold=%.2f",
         start_frame,
         max_frames,
         stride,
         resize,
         calibrator_name,
+        draw_mode,
+        calib_conf_threshold,
     )
 
     # --- Process video ----------------------------------------------------
     wall_clock_start = time.perf_counter()
+    accepted_count = 0
+    rejected_count = 0
 
     with VideoReader(
         args.input,
@@ -284,25 +359,49 @@ def main() -> None:
             height=output_height,
         ) as writer:
             for frame_index, frame in reader:
+                # --- HUD: frame index ------------------------------------
                 overlay_frame_index(frame, frame_index)
 
+                # --- Calibration -----------------------------------------
                 if calibrator is not None:
                     calibration_result = calibrator.estimate(frame)
-                    overlay_calibration_info(
-                        frame,
-                        calibrator_name,  # type: ignore[arg-type]
-                        calibration_result["conf"],
-                    )
+                    homography = calibration_result["H"]
+                    confidence = calibration_result["conf"]
+
+                    is_accepted = homography is not None and confidence >= calib_conf_threshold
+
+                    if is_accepted:
+                        accepted_count += 1
+                    else:
+                        rejected_count += 1
+
+                    # --- HUD: calibration status -------------------------
+                    overlay_calibration_status(frame, calibration_result, is_accepted)
+
+                    # --- Drawing -----------------------------------------
+                    if (
+                        draw_mode == "overlay"
+                        and is_accepted
+                        and homography is not None
+                        and calibrator_court_lines is not None
+                    ):
+                        draw_projected_lines(frame, homography, calibrator_court_lines)
+
+                    if draw_mode == "keypoints" and calibration_result["keypoints"] is not None:
+                        draw_keypoints(frame, calibration_result["keypoints"], show_index=False)
 
                 writer.write(frame)
 
                 if writer.frames_written % 100 == 0:
                     elapsed = time.perf_counter() - wall_clock_start
                     logger.info(
-                        "Progress: %d frames written  (%.1f s elapsed, ~%.1f fps)",
+                        "Progress: %d frames written  (%.1f s elapsed, ~%.1f fps)  "
+                        "calib_ok=%d  calib_fail=%d",
                         writer.frames_written,
                         elapsed,
                         writer.frames_written / max(elapsed, 1e-6),
+                        accepted_count,
+                        rejected_count,
                     )
 
             total_frames = writer.frames_written
@@ -311,12 +410,23 @@ def main() -> None:
     effective_fps = total_frames / max(wall_clock_elapsed, 1e-6)
 
     logger.info(
-        "Done — %d frames processed in %.1f s (%.1f effective fps). Output: %s",
+        "Done -- %d frames in %.1f s (%.1f fps). Output: %s",
         total_frames,
         wall_clock_elapsed,
         effective_fps,
         args.output,
     )
+
+    # --- Re-encode to H.264 for broad playback compatibility --------------
+    reencode_to_h264(args.output)
+
+    if calibrator is not None:
+        logger.info(
+            "Calibration stats -- accepted=%d  rejected=%d  accept_rate=%.1f%%",
+            accepted_count,
+            rejected_count,
+            100.0 * accepted_count / max(accepted_count + rejected_count, 1),
+        )
 
 
 if __name__ == "__main__":
