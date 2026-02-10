@@ -79,11 +79,13 @@ logger = logging.getLogger("run_video")
 DEFAULTS_CONFIG_PATH = _PROJECT_ROOT / "configs" / "default.yaml"
 
 # Cyan for smoothing HUD, yellow for reset indicator, magenta for ad HUD,
-# orange for mask HUD.
+# orange for mask HUD, lime-green for H-stabilizer HUD.
 SMOOTH_HUD_COLOR: tuple[int, int, int] = (255, 255, 0)  # Cyan (BGR)
 SMOOTH_RESET_COLOR: tuple[int, int, int] = (0, 255, 255)  # Yellow (BGR)
 AD_HUD_COLOR: tuple[int, int, int] = (255, 0, 255)  # Magenta (BGR)
 MASK_HUD_COLOR: tuple[int, int, int] = (0, 165, 255)  # Orange (BGR)
+HSTAB_HUD_COLOR: tuple[int, int, int] = (0, 255, 128)  # Lime-green (BGR)
+HSTAB_HOLD_COLOR: tuple[int, int, int] = (0, 200, 255)  # Amber (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -315,6 +317,33 @@ def overlay_mask_debug(
     )
 
 
+def overlay_stabilizer_status(
+    frame: np.ndarray,
+    alpha: float,
+    is_holding: bool,
+    hold_count: int,
+    max_hold_frames: int,
+    did_reject: bool,
+    hud_line_offset: int,
+) -> None:
+    """Draw homography stabilizer status (HUD line).  Mutates *frame*."""
+    _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30 * hud_line_offset))
+
+    if is_holding:
+        text = f"HSTAB=HOLD ({hold_count}/{max_hold_frames})"
+        color = HSTAB_HOLD_COLOR
+    elif did_reject:
+        text = f"HSTAB=REJECT (outlier) alpha={alpha:.2f}"
+        color = HSTAB_HOLD_COLOR
+    else:
+        text = f"HSTAB=ON alpha={alpha:.2f}"
+        color = HSTAB_HUD_COLOR
+
+    overlay_text_with_outline(frame, text, position, font_scale, color, thickness)
+
+
 # ---------------------------------------------------------------------------
 # Calibrator factory
 # ---------------------------------------------------------------------------
@@ -467,6 +496,38 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=2.0,
         help="Reset if error > factor * median(recent errors) (default: 2.0)",
+    )
+
+    # --- Homography stabilization -----------------------------------------
+    parser.add_argument(
+        "--stabilize_h",
+        action="store_true",
+        default=False,
+        help="Enable EMA temporal stabilization of the homography matrix.",
+    )
+    parser.add_argument(
+        "--h_alpha",
+        type=float,
+        default=0.9,
+        help=(
+            "EMA blending factor for H-space: higher = smoother / slower to react "
+            "(default: 0.9). Alpha weights the history; (1-alpha) weights the new observation."
+        ),
+    )
+    parser.add_argument(
+        "--hold_frames",
+        type=int,
+        default=15,
+        help="Max frames to hold last-good H when calibration fails (default: 15).",
+    )
+    parser.add_argument(
+        "--h_spike_factor",
+        type=float,
+        default=2.0,
+        help=(
+            "Outlier rejection threshold for H-stabilizer: reject when error or "
+            "projected-point displacement > factor * median(recent) (default: 2.0)."
+        ),
     )
 
     # --- Ad placement -----------------------------------------------------
@@ -653,13 +714,40 @@ def main() -> None:
             args.err_spike_factor,
         )
 
+    # --- Homography stabilizer (optional) ---------------------------------
+    stabilize_h_enabled: bool = args.stabilize_h
+    homography_stabilizer = None
+    h_alpha: float = args.h_alpha
+
+    if stabilize_h_enabled and calibrator is not None:
+        from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
+            refer_kps as _stab_refer_kps,
+        )
+        from tennis_virtual_ads.pipeline.temporal.homography_stabilizer import (
+            HomographyStabilizer,
+        )
+
+        homography_stabilizer = HomographyStabilizer(
+            reference_points=_stab_refer_kps.copy(),
+            alpha=args.h_alpha,
+            max_hold_frames=args.hold_frames,
+            spike_factor=args.h_spike_factor,
+        )
+        logger.info(
+            "Homography stabilizer enabled: alpha=%.2f  hold_frames=%d  spike_factor=%.1f",
+            args.h_alpha,
+            args.hold_frames,
+            args.h_spike_factor,
+        )
+
     # --- Jitter trackers (optional) ---------------------------------------
-    # We keep two: one for the raw homography and one for the smoothed
-    # homography (when smoothing is enabled).  This lets us quantify the
-    # improvement directly.
+    # We keep up to three trackers: raw, smoothed (keypoint EMA),
+    # and stabilized (H-space EMA).  This lets us quantify the
+    # improvement each stage provides.
     jitter_tracker_enabled = not args.no_jitter_tracker and calibrator is not None
     raw_jitter_tracker: JitterTracker | None = None
     smoothed_jitter_tracker: JitterTracker | None = None
+    stabilized_jitter_tracker: JitterTracker | None = None
 
     if jitter_tracker_enabled:
         from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
@@ -669,7 +757,14 @@ def main() -> None:
         raw_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         if smooth_enabled:
             smoothed_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
-        logger.info("Jitter tracking enabled (raw%s)", " + smoothed" if smooth_enabled else "")
+        if stabilize_h_enabled:
+            stabilized_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
+        jitter_labels = ["raw"]
+        if smooth_enabled:
+            jitter_labels.append("smoothed")
+        if stabilize_h_enabled:
+            jitter_labels.append("stabilized")
+        logger.info("Jitter tracking enabled (%s)", " + ".join(jitter_labels))
 
     # --- Ad placement (optional) ------------------------------------------
     ad_config: dict[str, Any] = config.get("ad", {})
@@ -739,7 +834,7 @@ def main() -> None:
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "jitter_track=%s  ad=%s  masker=%s",
+        "stabilize_h=%s  jitter_track=%s  ad=%s  masker=%s",
         start_frame,
         max_frames,
         stride,
@@ -748,6 +843,7 @@ def main() -> None:
         draw_mode,
         calib_conf_threshold,
         smooth_enabled,
+        stabilize_h_enabled,
         jitter_tracker_enabled,
         ad_enabled,
         masker_name,
@@ -832,6 +928,46 @@ def main() -> None:
                     else:
                         rejected_count += 1
 
+                    # --- Homography stabilization (optional) --------------
+                    # Called on EVERY frame (even rejected ones) so the
+                    # hold-last-good counter advances correctly.
+                    stabilizer_is_holding = False
+                    stabilizer_did_reject = False
+
+                    if homography_stabilizer is not None:
+                        # Determine which error to pass: smoothed if
+                        # keypoint smoothing is active, else raw.
+                        stabilizer_input_error = (
+                            smoothed_error if smoother is not None else raw_error
+                        )
+
+                        if is_accepted and homography_for_drawing is not None:
+                            H_stable = homography_stabilizer.update(
+                                homography_for_drawing,
+                                confidence,
+                                stabilizer_input_error,
+                            )
+                        else:
+                            # Calibration failed/rejected: trigger hold.
+                            H_stable = homography_stabilizer.update(None, 0.0, None)
+
+                        stabilizer_is_holding = homography_stabilizer.is_holding
+                        stabilizer_did_reject = homography_stabilizer.did_reject_this_frame
+
+                        if H_stable is not None:
+                            homography_for_drawing = H_stable
+
+                            # Jitter tracking: stabilized H.
+                            if stabilized_jitter_tracker is not None:
+                                stabilized_jitter_tracker.update(H_stable)
+
+                    # --- Determine if we have a usable H ------------------
+                    # When the stabilizer is active, it may provide a held
+                    # H even when this frame's calibration was rejected.
+                    has_usable_homography = homography_for_drawing is not None and (
+                        is_accepted or stabilizer_is_holding
+                    )
+
                     # --- HUD: calibration status -------------------------
                     overlay_calibration_status(frame, calibration_result, is_accepted)
 
@@ -842,7 +978,7 @@ def main() -> None:
                     # --- Drawing -----------------------------------------
                     if (
                         draw_mode == "overlay"
-                        and is_accepted
+                        and has_usable_homography
                         and homography_for_drawing is not None
                         and calibrator_court_lines is not None
                     ):
@@ -874,7 +1010,7 @@ def main() -> None:
                         ad_placer is not None
                         and ad_rgba is not None
                         and prepared_ad_placement is not None
-                        and is_accepted
+                        and has_usable_homography
                         and homography_for_drawing is not None
                     ):
                         warped_rgba, warped_mask = ad_placer.warp(
@@ -893,12 +1029,24 @@ def main() -> None:
 
                         ad_placer.composite(frame, warped_rgba, effective_alpha)
 
-                    # --- HUD: ad status ----------------------------------
+                    # --- HUD: ad / stabilizer / mask status ---------------
                     # Count how many HUD lines are already used so each
                     # status line lands on the correct row.
                     next_hud_line = 2
                     if smoother is not None:
                         next_hud_line = 3
+
+                    if homography_stabilizer is not None:
+                        overlay_stabilizer_status(
+                            frame,
+                            h_alpha,
+                            stabilizer_is_holding,
+                            homography_stabilizer.hold_count,
+                            args.hold_frames,
+                            stabilizer_did_reject,
+                            next_hud_line,
+                        )
+                        next_hud_line += 1
 
                     if ad_placer is not None:
                         overlay_ad_status(frame, ad_anchor_name, smooth_enabled, next_hud_line)
@@ -966,6 +1114,13 @@ def main() -> None:
             logger.info("Jitter (smoothed H) -- %s", smooth_summary.to_log_string())
         else:
             logger.info("Jitter (smoothed H) -- not enough frames to compute")
+
+    if stabilized_jitter_tracker is not None:
+        stab_summary = stabilized_jitter_tracker.get_summary()
+        if stab_summary is not None:
+            logger.info("Jitter (stabilized H) -- %s", stab_summary.to_log_string())
+        else:
+            logger.info("Jitter (stabilized H) -- not enough frames to compute")
 
 
 if __name__ == "__main__":

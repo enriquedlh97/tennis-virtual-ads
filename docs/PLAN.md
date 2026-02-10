@@ -9,8 +9,8 @@
 - [x] **Step 2C** — Video integration (calibrator in run_video.py, court overlay per frame)
 - [x] **Step 3A** — Temporal keypoint smoothing (EMA smoother + error spike reset)
 - [x] **Step 4A** — Ad warp + naive composite (AdPlacer, placement spec, alpha blend)
+- [x] **Step 6A** — HomographyStabilizer v1 (EMA in H-space + hold-last-good + config-switch guard)
 - [ ] **Step 3B** — Scene-cut detection (reset smoother on camera changes)
-- [ ] **Step 4** — Temporal stabilizer for homography (direct H smoothing, if needed)
 - [x] **Step 5A** — OcclusionMasker v1 (players only — Mask R-CNN person segmentation + ad occlusion)
 - [ ] **Step 5B** — OcclusionMasker v2 (ball / net / shadows)
 - [ ] **Step 7** — Composite with occlusion (advanced blending)
@@ -415,6 +415,85 @@ uv run python scripts/run_video.py \
 * No ball, net, or shadow handling yet (Step 5B).
 * Mask edges may show slight halo artifacts on fast-moving limbs.
 * Only one masker type (`person`) available; the factory is extensible.
+
+---
+
+### Step 6A — HomographyStabilizer v1 (completed)
+
+**Goal:** Further reduce visible jitter by stabilizing homographies
+directly in H-space, and add hold-last-good behavior so the overlay/ad
+persists through brief calibration failures.
+
+**What was implemented:**
+
+* `HomographyStabilizer` class in
+  `src/tennis_virtual_ads/pipeline/temporal/homography_stabilizer.py`
+  with three capabilities:
+  1. **EMA in H-space** — `H_ema = alpha * H_ema + (1-alpha) * H_new`,
+     with both matrices normalised to `H[2,2]=1` each update.
+  2. **Outlier rejection** — reprojection error spike detection (same
+     rolling-median approach as `KeypointSmoother`).
+  3. **Config-switch guard** — detects anomalous jumps in projected
+     reference-point positions (catches best-of-12 config switches where
+     reproj error is similar but the overlay geometry snaps).
+  4. **Hold-last-good** — when calibration fails, returns the last EMA
+     H for up to K frames before giving up.
+* Integration in `run_video.py` with CLI flags:
+  `--stabilize_h`, `--h_alpha`, `--hold_frames`, `--h_spike_factor`.
+* Pipeline ordering when both are enabled:
+  `raw keypoints → KeypointSmoother → recompute H → HomographyStabilizer → final H`.
+* Third jitter tracker (`stabilized`) reports metrics after all processing.
+* HUD line shows "HSTAB=ON alpha=X.XX" (lime-green) or
+  "HSTAB=HOLD (N/K)" (amber) when holding last-good.
+
+**Run commands (comparison):**
+
+```bash
+# Keypoint smoothing only (baseline for comparison):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_smooth_only.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints \
+    --ad_enable --ad_image_path assets/test_ad.png
+
+# Keypoint smoothing + H stabilizer:
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_stabilized.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints --stabilize_h \
+    --ad_enable --ad_image_path assets/test_ad.png
+
+# H stabilizer only (no keypoint smoothing):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_hstab_only.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --stabilize_h \
+    --ad_enable --ad_image_path assets/test_ad.png
+```
+
+Compare the Jitter lines (raw → smoothed → stabilized) in the
+end-of-run output.  Lower `mean_accel` = more stable overlay/ad.
+
+**Architecture notes:**
+
+* The stabilizer sits after keypoint smoothing and operates on
+  whichever H the upstream produces.  It is fully decoupled from the
+  calibrator, smoother, and ad placer.
+* When the stabilizer is active and holding last-good, the overlay/ad
+  continues rendering even on calibration-rejected frames (until the
+  hold window expires).
+* Both stabilization and keypoint smoothing are optional and
+  independent.  Enabling both gives the best results; either alone
+  provides partial improvement.
+
+**Known limitations:**
+
+* No scene-cut detection — the stabilizer will hold stale H through a
+  camera switch (up to `hold_frames` frames).  Step 3B will add cut
+  detection to trigger `reset()`.
+* EMA in H-space assumes the camera motion between frames is small
+  enough that element-wise averaging is a reasonable approximation.
+  Large sudden camera moves could produce brief distortion.
 
 ---
 
