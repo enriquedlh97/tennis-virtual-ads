@@ -15,3 +15,14 @@ resize: null
 # Court calibrator (null → no calibration overlay)
 # Options: "dummy"
 calibrator: null
+
+# ---------------------------------------------------------------------------
+# Ad placement
+# ---------------------------------------------------------------------------
+ad:
+  enabled: false
+  image_path: null          # Path to RGBA PNG (e.g. "assets/sponsor_ad.png")
+  anchor: "near_baseline_center"
+  width_ratio: 0.35         # Ad width as fraction of court width
+  height_ratio: 0.12        # Ad height as fraction of court height
+  y_offset_ratio: 0.06      # Offset from baseline toward net (fraction of court height)

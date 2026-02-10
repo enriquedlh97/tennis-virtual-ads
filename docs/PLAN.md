@@ -7,9 +7,11 @@
 - [x] **Step 2A** — Calibrator interface + dummy wiring (`CourtCalibrator` ABC, `DummyCalibrator`, `--calibrator` flag)
 - [x] **Step 2B** — Single-image calibrator proof (TennisCourtDetector wrapper + debug script)
 - [x] **Step 2C** — Video integration (calibrator in run_video.py, court overlay per frame)
-- [ ] **Step 2D** — Ad representation + placement spec
-- [ ] **Step 4** — Temporal stabilizer for homography
-- [ ] **Step 5** — Ad warp + naive composite
+- [x] **Step 3A** — Temporal keypoint smoothing (EMA smoother + error spike reset)
+- [x] **Step 4A** — Ad warp + naive composite (AdPlacer, placement spec, alpha blend)
+- [ ] **Step 3B** — Scene-cut detection (reset smoother on camera changes)
+- [ ] **Step 4** — Temporal stabilizer for homography (direct H smoothing, if needed)
+- [ ] **Step 5** — OcclusionMasker v1 (players only)
 - [ ] **Step 6** — OcclusionMasker v1 (players only)
 - [ ] **Step 7** — Composite with occlusion
 - [ ] **Step 8** — Debug views
@@ -221,6 +223,129 @@ uv run python scripts/run_video.py \
 * No temporal smoothing -- overlay may "swim" frame-to-frame.
 * No scene-cut detection -- if the camera changes, stale H may flash briefly.
 * CPU-only inference is slow (~1-3 fps); GPU speeds this up significantly.
+
+---
+
+### Step 3A — Temporal keypoint smoothing (completed)
+
+**Goal:** Reduce frame-to-frame overlay jitter by smoothing detected
+keypoints over time and recomputing the homography from the smoothed
+keypoints.
+
+**What was implemented:**
+
+* `KeypointSmoother` class in `src/tennis_virtual_ads/pipeline/temporal/keypoint_smoother.py`
+  using per-keypoint exponential moving average (EMA).
+* Configurable `alpha` (default 0.7): higher = more responsive, lower = smoother.
+* Error spike detection: if reprojection error exceeds `factor * median(recent errors)`,
+  the smoother auto-resets to prevent drift after bad detections or scene changes.
+* Integration in `run_video.py` with new CLI flags:
+  `--smooth_keypoints`, `--kp_smooth_alpha`, `--reset_on_err_spike`,
+  `--no_reset_on_err_spike`, `--err_spike_factor`.
+* Third HUD line shows smoothing status: "SMOOTH=ON err=X.Xpx" (cyan)
+  or "SMOOTH=RESET (spike detected)" (yellow).
+* End-of-run stats include reset count.
+* `JitterTracker` in `src/tennis_virtual_ads/pipeline/temporal/jitter_tracker.py`
+  quantifies overlay stability using projected-point acceleration (MPPA).
+  Reports mean, p95, and max acceleration in pixels at end-of-run.
+  When smoothing is enabled, tracks both raw and smoothed H for direct comparison.
+  Disable with `--no_jitter_tracker`.
+
+**Run commands (comparison):**
+
+```bash
+# Baseline (no smoothing):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_baseline.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay
+
+# With smoothing (mild):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_smooth_07.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay \
+    --smooth_keypoints --kp_smooth_alpha 0.7
+
+# With smoothing (aggressive):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_smooth_03.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay \
+    --smooth_keypoints --kp_smooth_alpha 0.3
+```
+
+Compare the "Jitter (raw H)" and "Jitter (smoothed H)" lines in the
+end-of-run output.  Lower `mean_accel` = more stable overlay.
+
+**Architecture notes:**
+
+* Smoothing is a post-processing layer that sits between the calibrator
+  and the drawing step. The calibrator still runs independently per frame.
+* `KeypointSmoother` is stateless with respect to the calibrator -- it
+  only receives the `(14, 2)` keypoints array and optionally the
+  reprojection error.
+* After smoothing, the homography is recomputed from smoothed keypoints
+  using the same `get_trans_matrix` best-of-12 selector.
+* If smoothing is disabled (`--smooth_keypoints` not passed), the
+  pipeline behaves exactly as before -- zero performance/behavior change.
+
+**Known limitations:**
+
+* No scene-cut detection -- the smoother relies on error spike detection
+  as a proxy, which may be slow to react on hard cuts (Step 3B).
+* EMA has no "forgetting" of keypoints that disappear -- if a keypoint
+  stops being detected, the smoothed value carries forward indefinitely.
+
+---
+
+### Step 4A — Ad warp + naive composite (completed)
+
+**Goal:** Warp an RGBA ad image onto the court surface using the
+homography and alpha-composite it into the output video.
+
+**What was implemented:**
+
+* `PlacementSpec` TypedDict + `compute_ad_court_corners()` in
+  `src/tennis_virtual_ads/pipeline/placer/placement.py` -- converts
+  anchor name + width/height/offset ratios into 4 court-reference
+  corners.
+* `AdPlacer` class in `src/tennis_virtual_ads/pipeline/placer/ad_placer.py`
+  with `warp()` (perspective transform) and `composite()` (alpha blend).
+* Integration in `run_video.py` with CLI flags: `--ad_enable`,
+  `--ad_image_path`, `--ad_anchor`, `--ad_width_ratio`,
+  `--ad_height_ratio`, `--ad_y_offset_ratio`.
+* Config defaults in `configs/default.yaml` under `ad:` section.
+* HUD line: "AD=ON anchor=near_baseline_center (smooth H)" in magenta.
+* Uses smoothed H when `--smooth_keypoints` is enabled; raw H otherwise.
+* Ad is skipped on frames where calibration fails (no H available).
+
+**Run command:**
+
+```bash
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_with_ad.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints \
+    --ad_enable --ad_image_path assets/test_ad.png
+```
+
+**Architecture notes:**
+
+* Placement is defined in court-reference coordinates (the same coordinate
+  system used by `CourtReference`).  The 4 corners are computed once at
+  startup, then projected through H each frame via `cv2.perspectiveTransform`.
+* `AdPlacer` is stateless and reusable across frames.
+* Alpha compositing is naive: `frame = frame*(1-alpha) + ad*alpha`.
+  No occlusion masking yet -- the ad draws *over* players.
+* Anchor registry is extensible: add new entries to `_ANCHOR_REGISTRY`
+  in `placement.py` to support other court positions.
+
+**Known limitations:**
+
+* No occlusion handling -- ad is drawn over players, ball, rackets.
+* Only one ad at a time (single placement spec).
+* Ad appears flat -- no shadow/lighting adaptation.
 
 ---
 
