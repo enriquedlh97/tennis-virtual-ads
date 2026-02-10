@@ -11,9 +11,9 @@
 - [x] **Step 4A** — Ad warp + naive composite (AdPlacer, placement spec, alpha blend)
 - [ ] **Step 3B** — Scene-cut detection (reset smoother on camera changes)
 - [ ] **Step 4** — Temporal stabilizer for homography (direct H smoothing, if needed)
-- [ ] **Step 5** — OcclusionMasker v1 (players only)
-- [ ] **Step 6** — OcclusionMasker v1 (players only)
-- [ ] **Step 7** — Composite with occlusion
+- [x] **Step 5A** — OcclusionMasker v1 (players only — Mask R-CNN person segmentation + ad occlusion)
+- [ ] **Step 5B** — OcclusionMasker v2 (ball / net / shadows)
+- [ ] **Step 7** — Composite with occlusion (advanced blending)
 - [ ] **Step 8** — Debug views
 
 ---
@@ -346,6 +346,75 @@ uv run python scripts/run_video.py \
 * No occlusion handling -- ad is drawn over players, ball, rackets.
 * Only one ad at a time (single placement spec).
 * Ad appears flat -- no shadow/lighting adaptation.
+
+---
+
+### Step 5A — OcclusionMasker v1: players only (completed)
+
+**Goal:** Generate a per-frame occlusion mask for people (players, ball
+kids, umpire) and use it to prevent the ad from drawing over them.
+
+**What was implemented:**
+
+* `OcclusionMasker` ABC + `OcclusionMaskerResult` TypedDict in
+  `src/tennis_virtual_ads/pipeline/maskers/base.py` — mirrors the
+  `CourtCalibrator` / `CalibrationResult` pattern.
+* `PersonMasker` in `src/tennis_virtual_ads/pipeline/maskers/person_masker.py`
+  using torchvision `maskrcnn_resnet50_fpn` (COCO-pretrained, person
+  class = label 1).  Per-instance masks are merged via max (union) and
+  binarised at 0.5.
+* Masker integration in `run_video.py` with CLI flags:
+  `--masker {none, person}`, `--masker_conf_threshold`,
+  `--mask_dilate_px`, `--mask_debug`.
+* Occlusion compositing: `effective_alpha = warped_mask * (1 - occ_mask)`
+  so players remain visible through the ad.
+* Dilation via `cv2.dilate` with an elliptical kernel to extend the
+  mask slightly and cover rackets near the body.
+* HUD line shows "MASK=person persons=N" in orange.
+* `--mask_debug` renders a red-tinted mask preview in the bottom-right
+  corner of the output video.
+* `[occlusion]` optional extras group added to `pyproject.toml`.
+
+**Dependencies:**
+
+Requires `torch` + `torchvision` (same as `[calibration]`).  Install:
+
+```bash
+uv pip install -e ".[occlusion]"
+```
+
+**Note:** On first run, torchvision auto-downloads Mask R-CNN pretrained
+weights (~170 MB).  A log message is emitted during loading.
+
+**Run command:**
+
+```bash
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 output_with_occlusion.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints \
+    --ad_enable --ad_image_path assets/test_ad.png \
+    --masker person --mask_debug
+```
+
+**Architecture notes:**
+
+* The masker runs independently per frame before ad compositing.  It
+  does not know about homography or placement — it only produces a
+  pixel mask.
+* The `effective_alpha` multiplication is the only coupling point
+  between the masker and the ad placer, keeping both modules fully
+  decoupled.
+* Masking is purely optional — when `--masker none` (default), the
+  pipeline behaves exactly as before with zero overhead.
+
+**Known limitations:**
+
+* Mask R-CNN is ~200–500 ms/frame on CPU.  GPU recommended for
+  interactive speeds.
+* No ball, net, or shadow handling yet (Step 5B).
+* Mask edges may show slight halo artifacts on fast-moving limbs.
+* Only one masker type (`person`) available; the factory is extensible.
 
 ---
 

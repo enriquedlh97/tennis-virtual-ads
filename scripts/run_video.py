@@ -57,6 +57,7 @@ from tennis_virtual_ads.pipeline.calibrators.base import (  # noqa: E402
     CourtCalibrator,
 )
 from tennis_virtual_ads.pipeline.calibrators.dummy import DummyCalibrator  # noqa: E402
+from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker  # noqa: E402
 from tennis_virtual_ads.pipeline.placer.ad_placer import AdPlacer  # noqa: E402
 from tennis_virtual_ads.pipeline.placer.placement import (  # noqa: E402
     AVAILABLE_ANCHORS,
@@ -77,10 +78,12 @@ logger = logging.getLogger("run_video")
 
 DEFAULTS_CONFIG_PATH = _PROJECT_ROOT / "configs" / "default.yaml"
 
-# Cyan for smoothing HUD, yellow for reset indicator, magenta for ad HUD.
+# Cyan for smoothing HUD, yellow for reset indicator, magenta for ad HUD,
+# orange for mask HUD.
 SMOOTH_HUD_COLOR: tuple[int, int, int] = (255, 255, 0)  # Cyan (BGR)
 SMOOTH_RESET_COLOR: tuple[int, int, int] = (0, 255, 255)  # Yellow (BGR)
 AD_HUD_COLOR: tuple[int, int, int] = (255, 0, 255)  # Magenta (BGR)
+MASK_HUD_COLOR: tuple[int, int, int] = (0, 165, 255)  # Orange (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -254,6 +257,64 @@ def overlay_ad_status(
     overlay_text_with_outline(frame, text, position, font_scale, AD_HUD_COLOR, thickness)
 
 
+def overlay_mask_status(
+    frame: np.ndarray,
+    masker_name: str,
+    instance_count: int,
+    hud_line_offset: int,
+) -> None:
+    """Draw occlusion mask status (HUD line).  Mutates *frame*."""
+    _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30 * hud_line_offset))
+
+    text = f"MASK={masker_name} persons={instance_count}"
+    overlay_text_with_outline(frame, text, position, font_scale, MASK_HUD_COLOR, thickness)
+
+
+def overlay_mask_debug(
+    frame: np.ndarray,
+    occlusion_mask: np.ndarray,
+) -> None:
+    """Draw a small semi-transparent mask preview in the bottom-right corner.
+
+    Renders the occlusion mask as a red-tinted thumbnail (1/4 frame size)
+    so the developer can see what the masker is detecting.  Mutates *frame*.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    preview_width = frame_width // 4
+    preview_height = frame_height // 4
+
+    # Resize mask to thumbnail size.
+    mask_small = cv2.resize(
+        occlusion_mask, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+    )
+
+    # Create red-tinted overlay: red channel = mask, others = 0.
+    overlay = np.zeros((preview_height, preview_width, 3), dtype=np.uint8)
+    overlay[:, :, 2] = (mask_small * 255).astype(np.uint8)  # Red channel (BGR)
+
+    # Blend into the bottom-right corner of the frame at 70% opacity.
+    x_offset = frame_width - preview_width - 10
+    y_offset = frame_height - preview_height - 10
+    roi = frame[y_offset : y_offset + preview_height, x_offset : x_offset + preview_width]
+
+    blend_alpha = 0.7
+    blended = cv2.addWeighted(roi, 1.0 - blend_alpha, overlay, blend_alpha, 0)
+    frame[y_offset : y_offset + preview_height, x_offset : x_offset + preview_width] = blended
+
+    # Label it.
+    font_scale = max(0.4, frame_width / 2560.0)
+    overlay_text_with_outline(
+        frame,
+        "MASK DEBUG",
+        (x_offset + 5, y_offset + 20),
+        font_scale,
+        (255, 255, 255),
+        max(1, int(font_scale * 2)),
+    )
+
+
 # ---------------------------------------------------------------------------
 # Calibrator factory
 # ---------------------------------------------------------------------------
@@ -276,6 +337,31 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 
     valid_names = ", ".join(sorted(CALIBRATOR_NAMES))
     raise ValueError(f"Unknown calibrator '{name}'. Available: {valid_names}")
+
+
+# ---------------------------------------------------------------------------
+# Masker factory
+# ---------------------------------------------------------------------------
+
+MASKER_NAMES: list[str] = ["none", "person"]
+
+
+def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
+    """Instantiate an occlusion masker by its registered name.
+
+    Uses lazy imports so that ``torch`` / ``torchvision`` are only loaded
+    when the ``person`` masker is actually requested.
+    """
+    if name == "person":
+        from tennis_virtual_ads.pipeline.maskers.person_masker import PersonMasker
+
+        return PersonMasker(
+            confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            device=kwargs.get("device"),
+        )
+
+    valid_names = ", ".join(sorted(MASKER_NAMES))
+    raise ValueError(f"Unknown masker '{name}'. Available: {valid_names}")
 
 
 # ---------------------------------------------------------------------------
@@ -420,6 +506,33 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Offset from baseline toward net as fraction of court height (default: 0.06).",
+    )
+
+    # --- Occlusion masking ------------------------------------------------
+    parser.add_argument(
+        "--masker",
+        type=str,
+        default="none",
+        choices=MASKER_NAMES,
+        help="Occlusion masker to use (default: none).",
+    )
+    parser.add_argument(
+        "--masker_conf_threshold",
+        type=float,
+        default=0.5,
+        help="Minimum detection score to include an instance in the mask (default: 0.5).",
+    )
+    parser.add_argument(
+        "--mask_dilate_px",
+        type=int,
+        default=3,
+        help="Pixels to dilate the occlusion mask by (covers rackets near body; default: 3).",
+    )
+    parser.add_argument(
+        "--mask_debug",
+        action="store_true",
+        default=False,
+        help="Show a mask preview overlay in the bottom-right corner of the output.",
     )
 
     # --- Jitter tracking --------------------------------------------------
@@ -603,10 +716,30 @@ def main() -> None:
             placement_spec["y_offset_ratio"],
         )
 
+    # --- Occlusion masker (optional) --------------------------------------
+    masker_name: str = args.masker
+    masker: OcclusionMasker | None = None
+    mask_dilate_px: int = args.mask_dilate_px
+    mask_debug: bool = args.mask_debug
+    masker_enabled: bool = masker_name != "none"
+
+    if masker_enabled:
+        masker = create_masker(
+            masker_name,
+            confidence_threshold=args.masker_conf_threshold,
+        )
+        logger.info(
+            "Occlusion masker: %s  conf_threshold=%.2f  dilate_px=%d  debug=%s",
+            masker_name,
+            args.masker_conf_threshold,
+            mask_dilate_px,
+            mask_debug,
+        )
+
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "jitter_track=%s  ad=%s",
+        "jitter_track=%s  ad=%s  masker=%s",
         start_frame,
         max_frames,
         stride,
@@ -617,6 +750,7 @@ def main() -> None:
         smooth_enabled,
         jitter_tracker_enabled,
         ad_enabled,
+        masker_name,
     )
 
     # --- Process video ----------------------------------------------------
@@ -717,6 +851,24 @@ def main() -> None:
                     if draw_mode == "keypoints" and raw_keypoints is not None:
                         draw_keypoints(frame, raw_keypoints, show_index=False)
 
+                    # --- Occlusion masking --------------------------------
+                    occlusion_mask: np.ndarray | None = None
+                    mask_instance_count: int = 0
+
+                    if masker is not None:
+                        masker_result = masker.mask(frame)
+                        occlusion_mask = masker_result["mask"]
+                        mask_instance_count = masker_result["debug"].get("instance_count", 0)
+
+                        # Dilate the mask slightly to cover rackets and
+                        # limbs near the body edge that the model may miss.
+                        if mask_dilate_px > 0 and np.any(occlusion_mask > 0):
+                            dilate_kernel = cv2.getStructuringElement(
+                                cv2.MORPH_ELLIPSE,
+                                (2 * mask_dilate_px + 1, 2 * mask_dilate_px + 1),
+                            )
+                            occlusion_mask = cv2.dilate(occlusion_mask, dilate_kernel, iterations=1)
+
                     # --- Ad placement ------------------------------------
                     if (
                         ad_placer is not None
@@ -731,14 +883,34 @@ def main() -> None:
                             prepared_ad_placement,
                             frame.shape,
                         )
-                        ad_placer.composite(frame, warped_rgba, warped_mask)
+
+                        # When an occlusion mask is active, punch through
+                        # the ad alpha so that players remain visible.
+                        if occlusion_mask is not None:
+                            effective_alpha = warped_mask * (1.0 - occlusion_mask)
+                        else:
+                            effective_alpha = warped_mask
+
+                        ad_placer.composite(frame, warped_rgba, effective_alpha)
 
                     # --- HUD: ad status ----------------------------------
+                    # Count how many HUD lines are already used so each
+                    # status line lands on the correct row.
+                    next_hud_line = 2
+                    if smoother is not None:
+                        next_hud_line = 3
+
                     if ad_placer is not None:
-                        # Ad HUD goes on the next available line after
-                        # smoothing (line 3) or calibration (line 2).
-                        hud_line = 3 if smoother is not None else 2
-                        overlay_ad_status(frame, ad_anchor_name, smooth_enabled, hud_line)
+                        overlay_ad_status(frame, ad_anchor_name, smooth_enabled, next_hud_line)
+                        next_hud_line += 1
+
+                    # --- HUD: mask status --------------------------------
+                    if masker is not None:
+                        overlay_mask_status(frame, masker_name, mask_instance_count, next_hud_line)
+
+                    # --- Debug: mask overlay ------------------------------
+                    if mask_debug and occlusion_mask is not None:
+                        overlay_mask_debug(frame, occlusion_mask)
 
                 writer.write(frame)
 

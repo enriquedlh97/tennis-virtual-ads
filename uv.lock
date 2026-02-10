@@ -1098,6 +1098,10 @@ dev = [
     { name = "ruff" },
     { name = "types-pyyaml" },
 ]
+occlusion = [
+    { name = "torch" },
+    { name = "torchvision" },
+]
 
 [package.metadata]
 requires-dist = [
@@ -1109,10 +1113,12 @@ requires-dist = [
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.4" },
     { name = "torch", marker = "extra == 'calibration'", specifier = ">=2.0" },
+    { name = "torch", marker = "extra == 'occlusion'", specifier = ">=2.0" },
     { name = "torchvision", marker = "extra == 'calibration'", specifier = ">=0.17" },
+    { name = "torchvision", marker = "extra == 'occlusion'", specifier = ">=0.17" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
 ]
-provides-extras = ["calibration", "dev"]
+provides-extras = ["calibration", "occlusion", "dev"]
 
 [[package]]
 name = "tomli"

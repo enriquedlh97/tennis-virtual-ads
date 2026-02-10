@@ -14,6 +14,10 @@ calibration = [
     "torch>=2.0",
     "torchvision>=0.17",
 ]
+occlusion = [
+    "torch>=2.0",
+    "torchvision>=0.17",
+]
 dev = [
     "pytest>=8.0",
     "coverage>=7.0",
