@@ -11,9 +11,10 @@
 #   1. Verifies NVIDIA GPU is visible
 #   2. Verifies uv is on PATH
 #   3. Installs Python dependencies (uv sync → creates .venv/)
-#   4. Installs pre-commit git hooks
-#   5. Runs smoke tests, linter, and type checker
-#   6. Prints success summary
+#   4. Downloads model weights (TennisCourtDetector from Google Drive)
+#   5. Installs pre-commit git hooks
+#   6. Runs smoke tests, linter, and type checker
+#   7. Prints success summary
 # ==========================================================================
 
 set -euo pipefail
@@ -63,12 +64,20 @@ fi
 # --------------------------------------------------------------------------
 # 3. Install Python dependencies + pre-commit hooks
 # --------------------------------------------------------------------------
-info "3/5  Installing Python dependencies"
+info "3/7  Installing Python dependencies"
 
 uv sync --all-extras
 pass "uv sync complete (venv created at .venv/)"
 
-info "4/5  Installing pre-commit hooks"
+# --------------------------------------------------------------------------
+# 4. Download model weights
+# --------------------------------------------------------------------------
+info "4/7  Downloading model weights"
+
+bash scripts/download_weights.sh
+pass "Model weights ready"
+
+info "5/7  Installing pre-commit hooks"
 
 uv run pre-commit install
 pass "Pre-commit hooks installed (will run on every git commit)"
@@ -76,7 +85,7 @@ pass "Pre-commit hooks installed (will run on every git commit)"
 # --------------------------------------------------------------------------
 # 5. Run checks (tests + lint + type check)
 # --------------------------------------------------------------------------
-info "5/5  Running checks"
+info "6/7  Running checks"
 
 echo "  --- pytest ---"
 uv run pytest tests/ -v
@@ -95,7 +104,7 @@ pass "Mypy type check passed"
 # --------------------------------------------------------------------------
 # Summary
 # --------------------------------------------------------------------------
-info "🎉  Setup complete!"
+info "7/7  Setup complete!"
 
 PYTHON_VERSION=$(uv run python --version 2>&1)
 

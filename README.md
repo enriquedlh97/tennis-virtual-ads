@@ -65,7 +65,12 @@ bash scripts/setup_ec2_post_reboot.sh
 This verifies:
 - `nvidia-smi` sees the T4 GPU
 - `uv sync --all-extras` installs all Python dependencies
+- Downloads model weights (TennisCourtDetector from Google Drive, ~178 MB)
 - `pytest`, `ruff`, `mypy` all pass
+
+> **Note:** Mask R-CNN weights (used by `--masker person`) are auto-downloaded
+> by torchvision on first run (~170 MB, cached in `~/.cache/torch/`).
+> No manual download needed for those.
 
 ### Workspace layout after setup
 
@@ -90,7 +95,16 @@ uv sync --all-extras
 
 Creates a virtual environment, installs runtime deps (`opencv-python`, `PyYAML`) and dev deps (`pytest`, `ruff`, `mypy`, `coverage`, `pre-commit`).
 
-### 2. Run on a local video
+### 2. Download model weights
+
+```bash
+bash scripts/download_weights.sh
+```
+
+Downloads TennisCourtDetector weights (~178 MB) from Google Drive into `weights/`.
+Skips automatically if weights already exist. This is handled automatically by the EC2 setup scripts.
+
+### 3. Run on a local video
 
 ```bash
 uv run python scripts/run_video.py path/to/input.mp4 output.mp4
@@ -98,14 +112,14 @@ uv run python scripts/run_video.py path/to/input.mp4 output.mp4
 
 Reads `input.mp4`, overlays the frame index on every frame, and writes `output.mp4`.
 
-### 3. Run with a calibrator
+### 4. Run with a calibrator
 
 ```bash
 # Dummy calibrator — overlays "CALIB: dummy conf=0.00" (no ML, just wiring)
 uv run python scripts/run_video.py input.mp4 output.mp4 --calibrator dummy
 ```
 
-### 4. Useful flags
+### 5. Useful flags
 
 ```bash
 # First 200 frames, starting at frame 500, every 2nd frame
@@ -122,7 +136,7 @@ uv run python scripts/run_video.py input.mp4 output.mp4 \
     --calibrator dummy --max_frames 100 --resize 640x360
 ```
 
-### 5. Dev commands
+### 6. Dev commands
 
 ```bash
 uv run pytest tests/ -v              # Run tests
