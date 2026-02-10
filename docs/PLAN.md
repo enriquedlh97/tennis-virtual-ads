@@ -13,7 +13,7 @@
 - [x] **Step 3B** — Scene-cut detection (frame diff + projection jump + cooldown)
 - [x] **Step 5A** — OcclusionMasker v1 (players only — Mask R-CNN person segmentation + ad occlusion)
 - [ ] **Step 5B** — OcclusionMasker v2 (ball / net / shadows)
-- [ ] **Step 7** — Composite with occlusion (advanced blending)
+- [x] **Step 7A** — Painted-look compositing v1 (shadow-preserving blend)
 - [ ] **Step 8** — Debug views
 
 ---
@@ -556,6 +556,82 @@ Thresholds are tunable per clip via CLI flags.
   (e.g. rapid camera switching, picture-in-picture).
 * Does not detect gradual transitions (dissolves, wipes) — only hard
   cuts.  Gradual transitions are rare in live tennis broadcasts.
+
+---
+
+### Step 7A — Painted-look compositing v1 (completed)
+
+**Goal:** Replace the flat alpha blend with a shadow-preserving blend
+so the ad inherits court illumination and looks "painted on" rather
+than "pasted on top".
+
+**What was implemented:**
+
+* `painted_composite()` function in
+  `src/tennis_virtual_ads/pipeline/compositor/painted_blend.py` —
+  pure OpenCV/NumPy, no new dependencies.
+* Algorithm (v1):
+  1. Alpha feather: optional Gaussian blur on `effective_alpha` to
+     soften hard edges.
+  2. Illumination estimation: convert frame to grayscale, apply large
+     Gaussian blur to extract low-frequency illumination field.
+  3. Shade normalisation: divide illumination by the median brightness
+     inside the court mask (projected 4 outer corners via H).  Clipped
+     to a safe range [0.6, 1.4] to avoid extreme colours.  Optional
+     `shade_strength` exponent controls intensity.
+  4. Apply shading: multiply warped ad RGB by shade map.
+  5. Composite: standard alpha blend with the shaded ad colours.
+* Court mask computed per-frame from the 4 outer court corners
+  projected through the final homography (`cv2.fillConvexPoly`).
+* Integration in `run_video.py` with CLI flags:
+  `--blend_mode {naive,painted_v1}`, `--shade_blur_ksize`,
+  `--shade_strength`, `--alpha_feather_px`, `--blend_debug`.
+* HUD line shows "BLEND=painted_v1 blur=41 strength=1.0 feather=3"
+  (teal) when painted blend is active.
+* `--blend_debug` renders a shade-map preview in the bottom-left
+  corner (separate from `--mask_debug` which uses bottom-right).
+* Default behaviour is unchanged (`--blend_mode naive`).
+
+**Run commands (comparison):**
+
+```bash
+# Naive blend (baseline):
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 out_naive.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints --stabilize_h \
+    --ad_enable --ad_image_path assets/test_ad.png \
+    --masker person --blend_mode naive
+
+# Painted v1 blend:
+uv run python scripts/run_video.py \
+    djokovic-10-sec.mp4 out_painted.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints --stabilize_h \
+    --ad_enable --ad_image_path assets/test_ad.png \
+    --masker person --blend_mode painted_v1 --blend_debug
+```
+
+**Architecture notes:**
+
+* The painted blend replaces only the final compositing call.  All
+  upstream components (calibration, smoothing, stabilisation, masking)
+  are untouched.
+* The court mask keeps shade normalisation local to the court surface,
+  avoiding bias from stands, scoreboard, or sky pixels.
+* When `--blend_mode naive` (default), the code path is identical to
+  before — zero performance or behaviour change.
+
+**Known limitations:**
+
+* v1 uses a single global shade map (one brightness multiplier per
+  pixel).  This works well for broad shadows but cannot handle
+  colour-cast differences (e.g. blue vs warm shadow tones).
+* Very heavy shadows (e.g. player shadow directly on the ad) may be
+  slightly exaggerated.  The `shade_strength` and clip range can be
+  tuned per clip.
+* Shade computation adds a small per-frame cost (~5-10 ms for the
+  Gaussian blur + normalisation).
 
 ---
 

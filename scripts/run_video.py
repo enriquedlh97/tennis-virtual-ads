@@ -87,6 +87,7 @@ MASK_HUD_COLOR: tuple[int, int, int] = (0, 165, 255)  # Orange (BGR)
 HSTAB_HUD_COLOR: tuple[int, int, int] = (0, 255, 128)  # Lime-green (BGR)
 HSTAB_HOLD_COLOR: tuple[int, int, int] = (0, 200, 255)  # Amber (BGR)
 CUT_HUD_COLOR: tuple[int, int, int] = (0, 0, 255)  # Red (BGR)
+BLEND_HUD_COLOR: tuple[int, int, int] = (200, 200, 0)  # Teal (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -356,6 +357,73 @@ def overlay_cut_detected(
 
     text = "CUT DETECTED -> RESET"
     overlay_text_with_outline(frame, text, position, font_scale, CUT_HUD_COLOR, thickness)
+
+
+def overlay_blend_status(
+    frame: np.ndarray,
+    blend_mode: str,
+    shade_blur_ksize: int,
+    shade_strength: float,
+    alpha_feather_px: int,
+    hud_line_offset: int,
+) -> None:
+    """Draw blend mode status (HUD line).  Mutates *frame*."""
+    _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30 * hud_line_offset))
+
+    text = (
+        f"BLEND={blend_mode} blur={shade_blur_ksize} "
+        f"strength={shade_strength:.1f} feather={alpha_feather_px}"
+    )
+    overlay_text_with_outline(frame, text, position, font_scale, BLEND_HUD_COLOR, thickness)
+
+
+def overlay_shade_debug(
+    frame: np.ndarray,
+    shade_map: np.ndarray,
+) -> None:
+    """Draw a small shade-map preview in the bottom-left corner.
+
+    Renders the normalised shade map as a grayscale thumbnail so the
+    developer can see what illumination the blender is detecting.
+    Placed in the bottom-LEFT to avoid overlapping the mask debug
+    preview (bottom-right).  Mutates *frame*.
+    """
+    frame_height, frame_width = frame.shape[:2]
+    preview_width = frame_width // 4
+    preview_height = frame_height // 4
+
+    # Normalise shade map to 0-255 for visualisation.
+    # shade_map is typically in [0.6, 1.4]; map 0.5-1.5 -> 0-255.
+    shade_vis = np.clip((shade_map - 0.5) / 1.0, 0.0, 1.0)
+    shade_vis = (shade_vis * 255).astype(np.uint8)
+    shade_small = cv2.resize(
+        shade_vis, (preview_width, preview_height), interpolation=cv2.INTER_AREA
+    )
+
+    # Convert to BGR for blending.
+    shade_bgr = cv2.cvtColor(shade_small, cv2.COLOR_GRAY2BGR)
+
+    # Blend into the bottom-left corner at 70% opacity.
+    x_offset = 10
+    y_offset = frame_height - preview_height - 10
+    roi = frame[y_offset : y_offset + preview_height, x_offset : x_offset + preview_width]
+
+    blend_alpha = 0.7
+    blended = cv2.addWeighted(roi, 1.0 - blend_alpha, shade_bgr, blend_alpha, 0)
+    frame[y_offset : y_offset + preview_height, x_offset : x_offset + preview_width] = blended
+
+    # Label it.
+    font_scale = max(0.4, frame_width / 2560.0)
+    overlay_text_with_outline(
+        frame,
+        "SHADE DEBUG",
+        (x_offset + 5, y_offset + 20),
+        font_scale,
+        (255, 255, 255),
+        max(1, int(font_scale * 2)),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -642,6 +710,42 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Show a mask preview overlay in the bottom-right corner of the output.",
     )
 
+    # --- Compositing / blend mode -----------------------------------------
+    parser.add_argument(
+        "--blend_mode",
+        type=str,
+        default="naive",
+        choices=["naive", "painted_v1"],
+        help=(
+            "Ad compositing mode: 'naive' = flat alpha blend (default); "
+            "'painted_v1' = shadow-preserving blend that inherits court illumination."
+        ),
+    )
+    parser.add_argument(
+        "--shade_blur_ksize",
+        type=int,
+        default=41,
+        help="Gaussian blur kernel size for illumination extraction (must be odd; default: 41).",
+    )
+    parser.add_argument(
+        "--shade_strength",
+        type=float,
+        default=1.0,
+        help="Shade exponent: 1.0 = natural, >1.0 = exaggerated shadow effect (default: 1.0).",
+    )
+    parser.add_argument(
+        "--alpha_feather_px",
+        type=int,
+        default=3,
+        help="Gaussian blur radius for alpha edge softening (0 = off; default: 3).",
+    )
+    parser.add_argument(
+        "--blend_debug",
+        action="store_true",
+        default=False,
+        help="Show a shade-map preview overlay in the bottom-left corner of the output.",
+    )
+
     # --- Jitter tracking --------------------------------------------------
     parser.add_argument(
         "--no_jitter_tracker",
@@ -901,10 +1005,58 @@ def main() -> None:
             mask_debug,
         )
 
+    # --- Blend mode (painted compositing, optional) -----------------------
+    blend_mode: str = args.blend_mode
+    blend_debug: bool = args.blend_debug
+    _painted_composite = None  # lazy-loaded below
+
+    # Outer-court corners in court-reference coordinates.  Used to compute
+    # a per-frame court mask for shade normalisation.
+    _outer_court_corners_ref: np.ndarray | None = None
+
+    if blend_mode == "painted_v1":
+        from tennis_virtual_ads.pipeline.compositor.painted_blend import (
+            painted_composite as _painted_composite_fn,
+        )
+
+        _painted_composite = _painted_composite_fn
+
+        from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.court_reference import (
+            CourtReference,
+        )
+
+        _court_ref = CourtReference()
+        # border_points = [baseline_top_left, baseline_top_right,
+        #                   baseline_bottom_right, baseline_bottom_left]
+        _outer_court_corners_ref = np.array(_court_ref.border_points, dtype=np.float32).reshape(
+            -1, 1, 2
+        )
+
+        logger.info(
+            "Painted blend enabled: blur=%d  strength=%.1f  feather=%d  debug=%s",
+            args.shade_blur_ksize,
+            args.shade_strength,
+            args.alpha_feather_px,
+            blend_debug,
+        )
+
+    def _compute_court_mask(
+        homography: np.ndarray,
+        frame_shape: tuple[int, ...],
+    ) -> np.ndarray | None:
+        """Project outer court corners and fill a polygon mask."""
+        if _outer_court_corners_ref is None:
+            return None
+        image_corners = cv2.perspectiveTransform(_outer_court_corners_ref, homography)
+        mask = np.zeros(frame_shape[:2], dtype=np.uint8)
+        pts = image_corners.reshape(-1, 2).astype(np.int32)
+        cv2.fillConvexPoly(mask, pts, 255)
+        return mask
+
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "stabilize_h=%s  cut_detect=%s  jitter_track=%s  ad=%s  masker=%s",
+        "stabilize_h=%s  cut_detect=%s  jitter_track=%s  ad=%s  masker=%s  blend=%s",
         start_frame,
         max_frames,
         stride,
@@ -918,6 +1070,7 @@ def main() -> None:
         jitter_tracker_enabled,
         ad_enabled,
         masker_name,
+        blend_mode,
     )
 
     # --- Process video ----------------------------------------------------
@@ -1106,6 +1259,8 @@ def main() -> None:
                             occlusion_mask = cv2.dilate(occlusion_mask, dilate_kernel, iterations=1)
 
                     # --- Ad placement ------------------------------------
+                    blend_debug_payload: dict[str, Any] = {}
+
                     if (
                         ad_placer is not None
                         and ad_rgba is not None
@@ -1127,9 +1282,24 @@ def main() -> None:
                         else:
                             effective_alpha = warped_mask
 
-                        ad_placer.composite(frame, warped_rgba, effective_alpha)
+                        # --- Compositing (naive or painted) ---------------
+                        if blend_mode == "painted_v1":
+                            assert _painted_composite is not None
+                            # Compute court mask from 4 outer corners.
+                            court_mask = _compute_court_mask(homography_for_drawing, frame.shape)
+                            blend_debug_payload = _painted_composite(
+                                frame,
+                                warped_rgba,
+                                effective_alpha,
+                                court_mask,
+                                shade_blur_ksize=args.shade_blur_ksize,
+                                shade_strength=args.shade_strength,
+                                alpha_feather_px=args.alpha_feather_px,
+                            )
+                        else:
+                            ad_placer.composite(frame, warped_rgba, effective_alpha)
 
-                    # --- HUD: ad / stabilizer / mask status ---------------
+                    # --- HUD: ad / stabilizer / mask / blend status -------
                     # Count how many HUD lines are already used so each
                     # status line lands on the correct row.
                     next_hud_line = 2
@@ -1157,13 +1327,29 @@ def main() -> None:
                         overlay_mask_status(frame, masker_name, mask_instance_count, next_hud_line)
                         next_hud_line += 1
 
+                    # --- HUD: blend status --------------------------------
+                    if blend_mode != "naive" and ad_placer is not None:
+                        overlay_blend_status(
+                            frame,
+                            blend_mode,
+                            args.shade_blur_ksize,
+                            args.shade_strength,
+                            args.alpha_feather_px,
+                            next_hud_line,
+                        )
+                        next_hud_line += 1
+
                     # --- HUD: cut detected --------------------------------
                     if is_cut:
                         overlay_cut_detected(frame, next_hud_line)
 
-                    # --- Debug: mask overlay ------------------------------
+                    # --- Debug: mask overlay (bottom-right) ---------------
                     if mask_debug and occlusion_mask is not None:
                         overlay_mask_debug(frame, occlusion_mask)
+
+                    # --- Debug: shade overlay (bottom-left) ---------------
+                    if blend_debug and blend_debug_payload and "shade_map" in blend_debug_payload:
+                        overlay_shade_debug(frame, blend_debug_payload["shade_map"])
 
                 writer.write(frame)
 
