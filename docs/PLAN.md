@@ -10,7 +10,7 @@
 - [x] **Step 3A** — Temporal keypoint smoothing (EMA smoother + error spike reset)
 - [x] **Step 4A** — Ad warp + naive composite (AdPlacer, placement spec, alpha blend)
 - [x] **Step 6A** — HomographyStabilizer v1 (EMA in H-space + hold-last-good + config-switch guard)
-- [ ] **Step 3B** — Scene-cut detection (reset smoother on camera changes)
+- [x] **Step 3B** — Scene-cut detection (frame diff + projection jump + cooldown)
 - [x] **Step 5A** — OcclusionMasker v1 (players only — Mask R-CNN person segmentation + ad occlusion)
 - [ ] **Step 5B** — OcclusionMasker v2 (ball / net / shadows)
 - [ ] **Step 7** — Composite with occlusion (advanced blending)
@@ -494,6 +494,68 @@ end-of-run output.  Lower `mean_accel` = more stable overlay/ad.
 * EMA in H-space assumes the camera motion between frames is small
   enough that element-wise averaging is a reasonable approximation.
   Large sudden camera moves could produce brief distortion.
+
+---
+
+### Step 3B — Scene-cut detection (completed)
+
+**Goal:** Detect camera cuts / major viewpoint changes and reset all
+temporal state so the pipeline never holds stale H across scene
+transitions.
+
+**What was implemented:**
+
+* `CutDetector` class in
+  `src/tennis_virtual_ads/pipeline/temporal/cut_detector.py` combining
+  two independent signals (OR logic):
+  1. **Signal A — Frame difference:** mean absolute diff on downscaled
+     grayscale thumbnail (160x90).  Normal inter-frame diffs are ~2–5;
+     cuts spike to 30–60+.  Threshold default: 18.
+  2. **Signal B — Projection jump:** mean displacement of 14 projected
+     court reference points between current and previous H.  Only
+     evaluated when both frames have valid H with conf >= 0.2.
+     Threshold default: 40 px.
+* **Cooldown** (default 10 frames) suppresses false positives from
+  scoreboard flashes and brief exposure changes.
+* On cut detection, all temporal state is reset: `KeypointSmoother`,
+  `HomographyStabilizer`, and all `JitterTracker` instances.
+* Integration in `run_video.py` with CLI flags:
+  `--cut_detection` / `--no_cut_detection`,
+  `--cut_frame_diff_thresh`, `--cut_proj_jump_thresh`,
+  `--cut_cooldown_frames`.
+* HUD shows red "CUT DETECTED -> RESET" on cut frames.
+* End-of-run stats include total cut count.
+* Per-cut log line with frame index and signal values.
+
+**Run command:**
+
+```bash
+uv run python scripts/run_video.py \
+    djokovic-scene-cut.mp4 output_scene_cut.mp4 \
+    --calibrator tennis_court_detector \
+    --draw_mode overlay --smooth_keypoints --stabilize_h \
+    --ad_enable --ad_image_path assets/test_ad.png \
+    --masker person
+```
+
+Cut detection is enabled by default.  Disable with `--no_cut_detection`.
+Thresholds are tunable per clip via CLI flags.
+
+**Architecture notes:**
+
+* The cut detector runs immediately after calibration and before any
+  temporal processing (smoothing, stabilization).  This ensures the
+  first post-cut frame initialises fresh state.
+* No heavy dependencies — uses only OpenCV and NumPy.
+* The detector is purely observational — it does not modify frames,
+  homographies, or masks.
+
+**Known limitations:**
+
+* Fixed thresholds may need tuning for very different broadcast styles
+  (e.g. rapid camera switching, picture-in-picture).
+* Does not detect gradual transitions (dissolves, wipes) — only hard
+  cuts.  Gradual transitions are rare in live tennis broadcasts.
 
 ---
 

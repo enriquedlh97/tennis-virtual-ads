@@ -86,6 +86,7 @@ AD_HUD_COLOR: tuple[int, int, int] = (255, 0, 255)  # Magenta (BGR)
 MASK_HUD_COLOR: tuple[int, int, int] = (0, 165, 255)  # Orange (BGR)
 HSTAB_HUD_COLOR: tuple[int, int, int] = (0, 255, 128)  # Lime-green (BGR)
 HSTAB_HOLD_COLOR: tuple[int, int, int] = (0, 200, 255)  # Amber (BGR)
+CUT_HUD_COLOR: tuple[int, int, int] = (0, 0, 255)  # Red (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -344,6 +345,19 @@ def overlay_stabilizer_status(
     overlay_text_with_outline(frame, text, position, font_scale, color, thickness)
 
 
+def overlay_cut_detected(
+    frame: np.ndarray,
+    hud_line_offset: int,
+) -> None:
+    """Draw cut-detected alert (HUD line).  Mutates *frame*."""
+    _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30 * hud_line_offset))
+
+    text = "CUT DETECTED -> RESET"
+    overlay_text_with_outline(frame, text, position, font_scale, CUT_HUD_COLOR, thickness)
+
+
 # ---------------------------------------------------------------------------
 # Calibrator factory
 # ---------------------------------------------------------------------------
@@ -528,6 +542,38 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "Outlier rejection threshold for H-stabilizer: reject when error or "
             "projected-point displacement > factor * median(recent) (default: 2.0)."
         ),
+    )
+
+    # --- Scene-cut detection -----------------------------------------------
+    parser.add_argument(
+        "--cut_detection",
+        action="store_true",
+        default=True,
+        help="Enable scene-cut detection to reset temporal state on camera changes (default: true).",
+    )
+    parser.add_argument(
+        "--no_cut_detection",
+        action="store_false",
+        dest="cut_detection",
+        help="Disable scene-cut detection.",
+    )
+    parser.add_argument(
+        "--cut_frame_diff_thresh",
+        type=float,
+        default=18.0,
+        help="Mean absolute frame diff threshold for cut detection (default: 18.0).",
+    )
+    parser.add_argument(
+        "--cut_proj_jump_thresh",
+        type=float,
+        default=40.0,
+        help="Mean projected-point displacement threshold in pixels (default: 40.0).",
+    )
+    parser.add_argument(
+        "--cut_cooldown_frames",
+        type=int,
+        default=10,
+        help="Frames to suppress cut triggers after a confirmed cut (default: 10).",
     )
 
     # --- Ad placement -----------------------------------------------------
@@ -766,6 +812,30 @@ def main() -> None:
             jitter_labels.append("stabilized")
         logger.info("Jitter tracking enabled (%s)", " + ".join(jitter_labels))
 
+    # --- Scene-cut detector (optional) ------------------------------------
+    cut_detection_enabled: bool = args.cut_detection and calibrator is not None
+    cut_detector = None
+
+    if cut_detection_enabled:
+        from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
+            refer_kps as _cut_refer_kps,
+        )
+        from tennis_virtual_ads.pipeline.temporal.cut_detector import CutDetector
+
+        cut_detector = CutDetector(
+            reference_points=_cut_refer_kps.copy(),
+            frame_diff_threshold=args.cut_frame_diff_thresh,
+            projection_jump_threshold=args.cut_proj_jump_thresh,
+            cooldown_frames=args.cut_cooldown_frames,
+        )
+        logger.info(
+            "Cut detection enabled: frame_diff_thresh=%.1f  proj_jump_thresh=%.1f  "
+            "cooldown=%d frames",
+            args.cut_frame_diff_thresh,
+            args.cut_proj_jump_thresh,
+            args.cut_cooldown_frames,
+        )
+
     # --- Ad placement (optional) ------------------------------------------
     ad_config: dict[str, Any] = config.get("ad", {})
     ad_enabled: bool = args.ad_enable or ad_config.get("enabled", False)
@@ -834,7 +904,7 @@ def main() -> None:
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "stabilize_h=%s  jitter_track=%s  ad=%s  masker=%s",
+        "stabilize_h=%s  cut_detect=%s  jitter_track=%s  ad=%s  masker=%s",
         start_frame,
         max_frames,
         stride,
@@ -844,6 +914,7 @@ def main() -> None:
         calib_conf_threshold,
         smooth_enabled,
         stabilize_h_enabled,
+        cut_detection_enabled,
         jitter_tracker_enabled,
         ad_enabled,
         masker_name,
@@ -854,6 +925,7 @@ def main() -> None:
     accepted_count = 0
     rejected_count = 0
     reset_count = 0
+    cut_count = 0
 
     with VideoReader(
         args.input,
@@ -884,6 +956,34 @@ def main() -> None:
                     raw_error = calibration_result["debug"].get("reprojection_error_px")
 
                     is_accepted = raw_homography is not None and confidence >= calib_conf_threshold
+
+                    # --- Scene-cut detection (before temporal processing) --
+                    is_cut = False
+                    if cut_detector is not None:
+                        is_cut = cut_detector.update(frame, raw_homography, confidence, raw_error)
+                        if is_cut:
+                            cut_count += 1
+                            logger.info(
+                                "Cut detected at frame %d  (frame_diff=%.1f  proj_jump=%s)",
+                                frame_index,
+                                cut_detector.last_frame_diff or 0.0,
+                                (
+                                    f"{cut_detector.last_projection_jump:.1f}"
+                                    if cut_detector.last_projection_jump is not None
+                                    else "N/A"
+                                ),
+                            )
+                            # Reset all temporal state.
+                            if smoother is not None:
+                                smoother.reset()
+                            if homography_stabilizer is not None:
+                                homography_stabilizer.reset()
+                            if raw_jitter_tracker is not None:
+                                raw_jitter_tracker.reset()
+                            if smoothed_jitter_tracker is not None:
+                                smoothed_jitter_tracker.reset()
+                            if stabilized_jitter_tracker is not None:
+                                stabilized_jitter_tracker.reset()
 
                     # --- Jitter tracking: raw H --------------------------
                     if (
@@ -1055,6 +1155,11 @@ def main() -> None:
                     # --- HUD: mask status --------------------------------
                     if masker is not None:
                         overlay_mask_status(frame, masker_name, mask_instance_count, next_hud_line)
+                        next_hud_line += 1
+
+                    # --- HUD: cut detected --------------------------------
+                    if is_cut:
+                        overlay_cut_detected(frame, next_hud_line)
 
                     # --- Debug: mask overlay ------------------------------
                     if mask_debug and occlusion_mask is not None:
@@ -1093,11 +1198,12 @@ def main() -> None:
 
     if calibrator is not None:
         logger.info(
-            "Calibration stats -- accepted=%d  rejected=%d  accept_rate=%.1f%%  resets=%d",
+            "Calibration stats -- accepted=%d  rejected=%d  accept_rate=%.1f%%  resets=%d  cuts=%d",
             accepted_count,
             rejected_count,
             100.0 * accepted_count / max(accepted_count + rejected_count, 1),
             reset_count,
+            cut_count,
         )
 
     # --- Jitter summary ---------------------------------------------------
