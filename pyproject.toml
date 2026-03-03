@@ -27,6 +27,9 @@ sam2 = [
 yolo = [
     "ultralytics>=8.0",
 ]
+guided_filter = [
+    "opencv-contrib-python>=4.8.0",
+]
 dev = [
     "pytest>=8.0",
     "coverage>=7.0",

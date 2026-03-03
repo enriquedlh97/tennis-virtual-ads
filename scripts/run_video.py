@@ -539,6 +539,9 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             s_high=kwargs.get("s_high"),
             v_low=kwargs.get("v_low"),
             v_high=kwargs.get("v_high"),
+            softness=kwargs.get("softness", 0.0),
+            guided_filter_radius=kwargs.get("guided_filter_radius", 8),
+            guided_filter_eps=kwargs.get("guided_filter_eps", 0.01),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -874,6 +877,24 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument("--court_v_low", type=int, default=None, help="HSV V lower bound override.")
     parser.add_argument(
         "--court_v_high", type=int, default=None, help="HSV V upper bound override."
+    )
+    parser.add_argument(
+        "--court_key_softness",
+        type=float,
+        default=0.0,
+        help="Soft-keying falloff width in HSV units. 0 = binary (default). Typical: 10-20.",
+    )
+    parser.add_argument(
+        "--guided_filter_radius",
+        type=int,
+        default=8,
+        help="Guided filter spatial window radius (default: 8). Only used when softness > 0.",
+    )
+    parser.add_argument(
+        "--guided_filter_eps",
+        type=float,
+        default=0.01,
+        help="Guided filter regularization (default: 0.01). Smaller = sharper edges.",
     )
 
     # --- Compositing / blend mode -----------------------------------------
@@ -1381,6 +1402,9 @@ def main() -> None:
             masker_kwargs["s_high"] = args.court_s_high
             masker_kwargs["v_low"] = args.court_v_low
             masker_kwargs["v_high"] = args.court_v_high
+            masker_kwargs["softness"] = args.court_key_softness
+            masker_kwargs["guided_filter_radius"] = args.guided_filter_radius
+            masker_kwargs["guided_filter_eps"] = args.guided_filter_eps
         logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,
