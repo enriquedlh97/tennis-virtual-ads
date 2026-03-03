@@ -211,6 +211,7 @@ class MatAnyoneMasker(OcclusionMasker):
 
         # --- Detect persons --------------------------------------------------
         boxes, scores = self._detect_persons(frame)
+        logger.info("MatAnyone prompt: detected %d persons (scores=%s)", len(boxes), scores)
         if len(boxes) == 0:
             self._is_initialized = False
             return OcclusionMaskerResult(
@@ -228,9 +229,8 @@ class MatAnyoneMasker(OcclusionMasker):
 
         # --- Prepare tensors -------------------------------------------------
         image_tensor = self._frame_to_tensor(frame)
-        mask_tensor = torch.from_numpy(binary_mask).float().to(self._device)
-        # Normalize mask to [0, 1] (it's currently 0/255).
-        mask_tensor = mask_tensor / 255.0
+        # Index mask: 0 = background, 1 = object 1.
+        mask_tensor = torch.from_numpy(binary_mask).to(self._device).gt(127).to(torch.uint8)
 
         # Optionally resize for VRAM savings.
         image_tensor, mask_tensor, scale = self._maybe_resize(image_tensor, mask_tensor)
@@ -238,9 +238,11 @@ class MatAnyoneMasker(OcclusionMasker):
         # --- Initialize MatAnyone --------------------------------------------
         self._processor.clear_memory()
 
-        # First call: provide mask + objects to initialize.
+        # First call: provide index mask + objects to initialize.
         with torch.inference_mode():
-            output_prob = self._processor.step(image_tensor, mask_tensor, objects=[1])
+            output_prob = self._processor.step(
+                image_tensor, mask_tensor, objects=[1], idx_mask=True
+            )
             # Second call: first_frame_pred to seed memory.
             output_prob = self._processor.step(image_tensor, first_frame_pred=True)
 
@@ -255,6 +257,12 @@ class MatAnyoneMasker(OcclusionMasker):
         self._last_prompt_frame = self._frame_count
 
         mean_conf = float(np.mean(scores)) if len(scores) > 0 else 0.0
+        logger.info(
+            "MatAnyone prompt result: alpha_mean=%.4f  alpha_max=%.4f  shape=%s",
+            float(alpha.mean()),
+            float(alpha.max()),
+            alpha.shape,
+        )
         return OcclusionMaskerResult(
             mask=alpha,
             conf=mean_conf,
