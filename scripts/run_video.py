@@ -454,14 +454,14 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 # Masker factory
 # ---------------------------------------------------------------------------
 
-MASKER_NAMES: list[str] = ["none", "person"]
+MASKER_NAMES: list[str] = ["none", "person", "sam2"]
 
 
 def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
     """Instantiate an occlusion masker by its registered name.
 
-    Uses lazy imports so that ``torch`` / ``torchvision`` are only loaded
-    when the ``person`` masker is actually requested.
+    Uses lazy imports so that ``torch`` / ``torchvision`` / ``sam2`` are
+    only loaded when the corresponding masker is actually requested.
     """
     if name == "person":
         from tennis_virtual_ads.pipeline.maskers.person_masker import PersonMasker
@@ -469,6 +469,16 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
         return PersonMasker(
             confidence_threshold=kwargs.get("confidence_threshold", 0.5),
             device=kwargs.get("device"),
+        )
+
+    if name == "sam2":
+        from tennis_virtual_ads.pipeline.maskers.sam2_masker import SAM2Masker
+
+        return SAM2Masker(
+            confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            device=kwargs.get("device"),
+            reprompt_interval=kwargs.get("reprompt_interval", 100),
+            use_yolo=kwargs.get("use_yolo", True),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -580,12 +590,48 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Reset if error > factor * median(recent errors) (default: 2.0)",
     )
 
+    # --- Keypoint tracking (optical flow) ------------------------------------
+    parser.add_argument(
+        "--track_keypoints",
+        action="store_true",
+        default=False,
+        help="Enable Lucas-Kanade optical flow tracking between detections to reduce jitter.",
+    )
+    parser.add_argument(
+        "--track_redetect_interval",
+        type=int,
+        default=12,
+        help="Max frames between full calibrator detections (default: 12).",
+    )
+    parser.add_argument(
+        "--track_min_points",
+        type=int,
+        default=6,
+        help="Minimum tracked keypoints before forcing re-detection (default: 6).",
+    )
+    parser.add_argument(
+        "--track_fb_error",
+        type=float,
+        default=1.0,
+        help="Forward-backward error threshold for LK tracking in pixels (default: 1.0).",
+    )
+
     # --- Homography stabilization -----------------------------------------
     parser.add_argument(
         "--stabilize_h",
         action="store_true",
         default=False,
-        help="Enable EMA temporal stabilization of the homography matrix.",
+        help="Enable temporal stabilization of the homography matrix.",
+    )
+    parser.add_argument(
+        "--h_filter",
+        type=str,
+        default="ema",
+        choices=["ema", "kalman"],
+        help=(
+            "Homography filter mode: 'ema' (exponential moving average, default) or "
+            "'kalman' (Kalman filter on decomposed camera parameters)."
+        ),
     )
     parser.add_argument(
         "--h_alpha",
@@ -595,6 +641,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "EMA blending factor for H-space: higher = smoother / slower to react "
             "(default: 0.9). Alpha weights the history; (1-alpha) weights the new observation."
         ),
+    )
+    parser.add_argument(
+        "--kalman_process_noise",
+        type=float,
+        default=1e-3,
+        help="Kalman filter process noise (higher = more responsive; default: 1e-3).",
+    )
+    parser.add_argument(
+        "--kalman_measurement_noise",
+        type=float,
+        default=1e-1,
+        help="Kalman filter measurement noise (higher = smoother; default: 1e-1).",
     )
     parser.add_argument(
         "--hold_frames",
@@ -709,6 +767,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=False,
         help="Show a mask preview overlay in the bottom-right corner of the output.",
     )
+    parser.add_argument(
+        "--sam2_reprompt_interval",
+        type=int,
+        default=100,
+        help="Re-run person detection for SAM2 prompting every N frames (default: 100).",
+    )
+    parser.add_argument(
+        "--sam2_no_yolo",
+        action="store_true",
+        default=False,
+        help="Disable YOLO for SAM2 prompting (use Mask R-CNN fallback instead).",
+    )
 
     # --- Compositing / blend mode -----------------------------------------
     parser.add_argument(
@@ -817,6 +887,26 @@ def main() -> None:
         if hasattr(calibrator, "court_line_segments"):
             calibrator_court_lines = calibrator.court_line_segments
 
+    # --- Keypoint tracker (optical flow, optional) -------------------------
+    track_keypoints_enabled: bool = args.track_keypoints and calibrator is not None
+    keypoint_tracker = None
+
+    if track_keypoints_enabled and calibrator is not None:
+        from tennis_virtual_ads.pipeline.temporal.keypoint_tracker import KeypointTracker
+
+        keypoint_tracker = KeypointTracker(
+            calibrator=calibrator,
+            redetect_interval=args.track_redetect_interval,
+            min_tracked_points=args.track_min_points,
+            fb_error_threshold=args.track_fb_error,
+        )
+        logger.info(
+            "Keypoint tracking enabled: redetect_interval=%d  min_points=%d  fb_error=%.1f",
+            args.track_redetect_interval,
+            args.track_min_points,
+            args.track_fb_error,
+        )
+
     # --- Keypoint smoother (optional) -------------------------------------
     smoother: KeypointSmoother | None = None
     # get_trans_matrix and _compute_reprojection_error are needed to
@@ -877,25 +967,34 @@ def main() -> None:
             HomographyStabilizer,
         )
 
+        h_filter_mode: str = args.h_filter
         homography_stabilizer = HomographyStabilizer(
             reference_points=_stab_refer_kps.copy(),
             alpha=args.h_alpha,
             max_hold_frames=args.hold_frames,
             spike_factor=args.h_spike_factor,
+            filter_mode=h_filter_mode,
+            kalman_process_noise=args.kalman_process_noise,
+            kalman_measurement_noise=args.kalman_measurement_noise,
         )
         logger.info(
-            "Homography stabilizer enabled: alpha=%.2f  hold_frames=%d  spike_factor=%.1f",
+            "Homography stabilizer enabled: mode=%s  alpha=%.2f  hold_frames=%d  "
+            "spike_factor=%.1f  kalman_pn=%.1e  kalman_mn=%.1e",
+            h_filter_mode,
             args.h_alpha,
             args.hold_frames,
             args.h_spike_factor,
+            args.kalman_process_noise,
+            args.kalman_measurement_noise,
         )
 
     # --- Jitter trackers (optional) ---------------------------------------
-    # We keep up to three trackers: raw, smoothed (keypoint EMA),
-    # and stabilized (H-space EMA).  This lets us quantify the
-    # improvement each stage provides.
+    # We keep up to four trackers: raw, tracked (LK optical flow),
+    # smoothed (keypoint EMA), and stabilized (H-space filter).
+    # This lets us quantify the improvement each stage provides.
     jitter_tracker_enabled = not args.no_jitter_tracker and calibrator is not None
     raw_jitter_tracker: JitterTracker | None = None
+    tracked_jitter_tracker: JitterTracker | None = None
     smoothed_jitter_tracker: JitterTracker | None = None
     stabilized_jitter_tracker: JitterTracker | None = None
 
@@ -905,11 +1004,15 @@ def main() -> None:
         )
 
         raw_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
+        if track_keypoints_enabled:
+            tracked_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         if smooth_enabled:
             smoothed_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         if stabilize_h_enabled:
             stabilized_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         jitter_labels = ["raw"]
+        if track_keypoints_enabled:
+            jitter_labels.append("tracked")
         if smooth_enabled:
             jitter_labels.append("smoothed")
         if stabilize_h_enabled:
@@ -993,9 +1096,15 @@ def main() -> None:
     masker_enabled: bool = masker_name != "none"
 
     if masker_enabled:
+        masker_kwargs: dict[str, Any] = {
+            "confidence_threshold": args.masker_conf_threshold,
+        }
+        if masker_name == "sam2":
+            masker_kwargs["reprompt_interval"] = args.sam2_reprompt_interval
+            masker_kwargs["use_yolo"] = not args.sam2_no_yolo
         masker = create_masker(
             masker_name,
-            confidence_threshold=args.masker_conf_threshold,
+            **masker_kwargs,
         )
         logger.info(
             "Occlusion masker: %s  conf_threshold=%.2f  dilate_px=%d  debug=%s",
@@ -1056,7 +1165,8 @@ def main() -> None:
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "stabilize_h=%s  cut_detect=%s  jitter_track=%s  ad=%s  masker=%s  blend=%s",
+        "track_kps=%s  stabilize_h=%s  h_filter=%s  cut_detect=%s  "
+        "jitter_track=%s  ad=%s  masker=%s  blend=%s",
         start_frame,
         max_frames,
         stride,
@@ -1065,7 +1175,9 @@ def main() -> None:
         draw_mode,
         calib_conf_threshold,
         smooth_enabled,
+        track_keypoints_enabled,
         stabilize_h_enabled,
+        args.h_filter,
         cut_detection_enabled,
         jitter_tracker_enabled,
         ad_enabled,
@@ -1102,7 +1214,12 @@ def main() -> None:
 
                 # --- Calibration -----------------------------------------
                 if calibrator is not None:
-                    calibration_result = calibrator.estimate(frame)
+                    # Use keypoint tracker (LK optical flow) when enabled,
+                    # otherwise fall back to direct calibrator detection.
+                    if keypoint_tracker is not None:
+                        calibration_result = keypoint_tracker.update(frame)
+                    else:
+                        calibration_result = calibrator.estimate(frame)
                     raw_homography = calibration_result["H"]
                     confidence = calibration_result["conf"]
                     raw_keypoints = calibration_result["keypoints"]
@@ -1127,16 +1244,23 @@ def main() -> None:
                                 ),
                             )
                             # Reset all temporal state.
+                            if keypoint_tracker is not None:
+                                keypoint_tracker.reset()
                             if smoother is not None:
                                 smoother.reset()
                             if homography_stabilizer is not None:
                                 homography_stabilizer.reset()
                             if raw_jitter_tracker is not None:
                                 raw_jitter_tracker.reset()
+                            if tracked_jitter_tracker is not None:
+                                tracked_jitter_tracker.reset()
                             if smoothed_jitter_tracker is not None:
                                 smoothed_jitter_tracker.reset()
                             if stabilized_jitter_tracker is not None:
                                 stabilized_jitter_tracker.reset()
+                            # Also reset SAM2 masker on scene cut.
+                            if masker is not None and hasattr(masker, "reset_on_cut"):
+                                masker.reset_on_cut()
 
                     # --- Jitter tracking: raw H --------------------------
                     if (
@@ -1145,6 +1269,17 @@ def main() -> None:
                         and raw_homography is not None
                     ):
                         raw_jitter_tracker.update(raw_homography)
+
+                    # --- Jitter tracking: tracked H ----------------------
+                    # When keypoint tracking is active, the raw_homography
+                    # IS the tracked output.  Feed it to the tracked tracker.
+                    if (
+                        tracked_jitter_tracker is not None
+                        and keypoint_tracker is not None
+                        and is_accepted
+                        and raw_homography is not None
+                    ):
+                        tracked_jitter_tracker.update(raw_homography)
 
                     # --- Smoothing (optional) ----------------------------
                     homography_for_drawing = raw_homography
@@ -1399,6 +1534,13 @@ def main() -> None:
             logger.info("Jitter (raw H)      -- %s", raw_summary.to_log_string())
         else:
             logger.info("Jitter (raw H)      -- not enough frames to compute")
+
+    if tracked_jitter_tracker is not None:
+        tracked_summary = tracked_jitter_tracker.get_summary()
+        if tracked_summary is not None:
+            logger.info("Jitter (tracked H)  -- %s", tracked_summary.to_log_string())
+        else:
+            logger.info("Jitter (tracked H)  -- not enough frames to compute")
 
     if smoothed_jitter_tracker is not None:
         smooth_summary = smoothed_jitter_tracker.get_summary()
