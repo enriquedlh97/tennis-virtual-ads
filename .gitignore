@@ -1,5 +1,6 @@
 # Test / scratch video files
 *.mp4
+assets/videos/
 
 # Model weights (large binary files — do NOT commit)
 weights/*.pt
