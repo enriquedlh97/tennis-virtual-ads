@@ -1708,6 +1708,51 @@ def main() -> None:
     reset_count = 0
     cut_count = 0
 
+    # --- Per-component timing accumulator ---------------------------------
+    class _PipelineTimings:
+        """Accumulate per-component timings across frames."""
+
+        __slots__ = ("_buckets", "_frame_count")
+
+        def __init__(self) -> None:
+            self._buckets: dict[str, list[float]] = {}
+            self._frame_count: int = 0
+
+        def start_frame(self) -> None:
+            self._frame_count += 1
+
+        def record(self, name: str, elapsed_ms: float) -> None:
+            if name not in self._buckets:
+                self._buckets[name] = []
+            self._buckets[name].append(elapsed_ms)
+
+        def report(self) -> str:
+            lines = [
+                f"=== PIPELINE TIMING ({self._frame_count} frames) ===",
+                f"{'Component':<24s} {'Mean':>8s} {'P95':>8s} {'Max':>8s} {'Total':>10s}",
+            ]
+            total_mean = 0.0
+            for name, vals in self._buckets.items():
+                arr = np.array(vals)
+                mean = float(arr.mean())
+                p95 = float(np.percentile(arr, 95))
+                mx = float(arr.max())
+                total = float(arr.sum())
+                total_mean += mean
+                lines.append(
+                    f"  {name:<22s} {mean:>7.1f}ms {p95:>7.1f}ms {mx:>7.1f}ms {total:>9.0f}ms"
+                )
+            lines.append(f"  {'TOTAL (per-frame)':<22s} {total_mean:>7.1f}ms")
+            target_ms = 1000.0 / 30.0
+            lines.append(
+                f"  Target for 30fps: {target_ms:.1f}ms/frame  |  "
+                f"Current: {total_mean:.1f}ms/frame  |  "
+                f"Gap: {total_mean - target_ms:+.1f}ms"
+            )
+            return "\n".join(lines)
+
+    pipeline_timings = _PipelineTimings()
+
     # Per-frame state carried through lookahead / two-pass buffering.
     class _FrameState:
         __slots__ = (
@@ -1803,6 +1848,7 @@ def main() -> None:
                     draw_keypoints(frame, state.raw_keypoints, show_index=False)
 
                 # Occlusion masking.
+                _t0 = time.perf_counter()
                 occlusion_mask: np.ndarray | None = None
                 mask_instance_count: int = 0
 
@@ -1818,8 +1864,10 @@ def main() -> None:
                             (2 * mask_dilate_px + 1, 2 * mask_dilate_px + 1),
                         )
                         occlusion_mask = cv2.dilate(occlusion_mask, dilate_kernel, iterations=1)
+                pipeline_timings.record("masker", (time.perf_counter() - _t0) * 1000)
 
                 # Ad placement + compositing.
+                _t0 = time.perf_counter()
                 blend_debug_payload: dict[str, Any] = {}
 
                 if (
@@ -1854,6 +1902,7 @@ def main() -> None:
                         )
                     else:
                         ad_placer.composite(frame, warped_rgba, effective_alpha)
+                pipeline_timings.record("composite", (time.perf_counter() - _t0) * 1000)
 
                 # HUD status lines.
                 next_hud_line = 2
@@ -1907,7 +1956,9 @@ def main() -> None:
                 if blend_debug and blend_debug_payload and "shade_map" in blend_debug_payload:
                     overlay_shade_debug(frame, blend_debug_payload["shade_map"])
 
+                _t0 = time.perf_counter()
                 writer.write(frame)
+                pipeline_timings.record("video_write", (time.perf_counter() - _t0) * 1000)
 
             # ==============================================================
             # H-lock helper (eliminates duplication across 3 modes)
@@ -1942,16 +1993,19 @@ def main() -> None:
             ) -> _FrameState:
                 nonlocal accepted_count, rejected_count, reset_count, cut_count
 
+                pipeline_timings.start_frame()
                 state = _FrameState()
 
                 if calibrator is None:
                     return state
 
                 # --- Calibration / tracking ---
+                _t0 = time.perf_counter()
                 if keypoint_tracker is not None:
                     calibration_result = keypoint_tracker.update(frame)
                 else:
                     calibration_result = calibrator.estimate(frame)
+                pipeline_timings.record("calibration", (time.perf_counter() - _t0) * 1000)
 
                 raw_homography = calibration_result["H"]
                 confidence = calibration_result["conf"]
@@ -1960,6 +2014,7 @@ def main() -> None:
                 is_accepted = raw_homography is not None and confidence >= calib_conf_threshold
 
                 # --- Scene-cut detection ---
+                _t0 = time.perf_counter()
                 is_cut = False
                 if cut_detector is not None:
                     is_cut = cut_detector.update(
@@ -2000,6 +2055,7 @@ def main() -> None:
                         # buffered frames render correctly -- same as masker.
                         # Masker reset is deferred to _render_frame so
                         # that buffered frames render correctly.
+                pipeline_timings.record("cut_detect", (time.perf_counter() - _t0) * 1000)
 
                 # --- Jitter tracking: raw H ---
                 if raw_jitter_tracker is not None and is_accepted and raw_homography is not None:
@@ -2015,6 +2071,7 @@ def main() -> None:
                     tracked_jitter_tracker.update(raw_homography)
 
                 # --- Keypoint smoothing ---
+                _t0 = time.perf_counter()
                 homography_for_drawing = raw_homography
                 smoothed_error: float | None = None
                 did_reset = False
@@ -2040,6 +2097,7 @@ def main() -> None:
                         )
                         if smoothed_jitter_tracker is not None:
                             smoothed_jitter_tracker.update(smoothed_h)
+                pipeline_timings.record("kp_smooth", (time.perf_counter() - _t0) * 1000)
 
                 if is_accepted:
                     accepted_count += 1
@@ -2235,6 +2293,9 @@ def main() -> None:
         effective_fps,
         args.output,
     )
+
+    # --- Per-component timing report --------------------------------------
+    logger.info("\n%s", pipeline_timings.report())
 
     # --- Re-encode to H.264 for broad playback compatibility --------------
     reencode_to_h264(args.output)
