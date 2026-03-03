@@ -479,7 +479,7 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 # Masker factory
 # ---------------------------------------------------------------------------
 
-MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key"]
+MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key", "rvm"]
 
 
 def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
@@ -542,6 +542,15 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             softness=kwargs.get("softness", 0.0),
             guided_filter_radius=kwargs.get("guided_filter_radius", 8),
             guided_filter_eps=kwargs.get("guided_filter_eps", 0.01),
+        )
+
+    if name == "rvm":
+        from tennis_virtual_ads.pipeline.maskers.rvm_masker import RVMMasker
+
+        return RVMMasker(
+            backbone=kwargs.get("backbone", "mobilenetv3"),
+            downsample_ratio=kwargs.get("downsample_ratio", 0.25),
+            device=kwargs.get("device"),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -895,6 +904,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.01,
         help="Guided filter regularization (default: 0.01). Smaller = sharper edges.",
+    )
+
+    # --- RVM masker -------------------------------------------------------
+    parser.add_argument(
+        "--rvm_backbone",
+        type=str,
+        default="mobilenetv3",
+        choices=["mobilenetv3", "resnet50"],
+        help="RVM backbone: mobilenetv3 (fast, default) or resnet50 (higher quality).",
+    )
+    parser.add_argument(
+        "--rvm_downsample_ratio",
+        type=float,
+        default=0.25,
+        help="RVM internal downsample ratio (0.25 for HD, 0.125 for 4K; default: 0.25).",
     )
 
     # --- Compositing / blend mode -----------------------------------------
@@ -1405,6 +1429,10 @@ def main() -> None:
             masker_kwargs["softness"] = args.court_key_softness
             masker_kwargs["guided_filter_radius"] = args.guided_filter_radius
             masker_kwargs["guided_filter_eps"] = args.guided_filter_eps
+        elif masker_name == "rvm":
+            masker_kwargs.pop("confidence_threshold", None)
+            masker_kwargs["backbone"] = args.rvm_backbone
+            masker_kwargs["downsample_ratio"] = args.rvm_downsample_ratio
         logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,

@@ -27,6 +27,10 @@ sam2 = [
 yolo = [
     "ultralytics>=8.0",
 ]
+matting = [
+    "torch>=2.0",
+    "torchvision>=0.17",
+]
 guided_filter = [
     "opencv-contrib-python>=4.8.0",
 ]

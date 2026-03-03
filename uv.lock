@@ -1978,6 +1978,10 @@ dev = [
 guided-filter = [
     { name = "opencv-contrib-python" },
 ]
+matting = [
+    { name = "torch" },
+    { name = "torchvision" },
+]
 occlusion = [
     { name = "torch" },
     { name = "torchvision" },
@@ -2004,15 +2008,17 @@ requires-dist = [
     { name = "sam2", marker = "extra == 'sam2'", specifier = ">=1.0" },
     { name = "scipy", specifier = ">=1.10" },
     { name = "torch", marker = "extra == 'calibration'", specifier = ">=2.0" },
+    { name = "torch", marker = "extra == 'matting'", specifier = ">=2.0" },
     { name = "torch", marker = "extra == 'occlusion'", specifier = ">=2.0" },
     { name = "torch", marker = "extra == 'sam2'", specifier = ">=2.0" },
     { name = "torchvision", marker = "extra == 'calibration'", specifier = ">=0.17" },
+    { name = "torchvision", marker = "extra == 'matting'", specifier = ">=0.17" },
     { name = "torchvision", marker = "extra == 'occlusion'", specifier = ">=0.17" },
     { name = "torchvision", marker = "extra == 'sam2'", specifier = ">=0.17" },
     { name = "types-pyyaml", marker = "extra == 'dev'", specifier = ">=6.0" },
     { name = "ultralytics", marker = "extra == 'yolo'", specifier = ">=8.0" },
 ]
-provides-extras = ["calibration", "occlusion", "sam2", "yolo", "guided-filter", "dev"]
+provides-extras = ["calibration", "occlusion", "sam2", "yolo", "matting", "guided-filter", "dev"]
 
 [[package]]
 name = "tomli"
