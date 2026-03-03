@@ -479,7 +479,7 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 # Masker factory
 # ---------------------------------------------------------------------------
 
-MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key", "rvm"]
+MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key", "rvm", "matanyone"]
 
 
 def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
@@ -551,6 +551,20 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             backbone=kwargs.get("backbone", "mobilenetv3"),
             downsample_ratio=kwargs.get("downsample_ratio", 0.25),
             device=kwargs.get("device"),
+        )
+
+    if name == "matanyone":
+        from tennis_virtual_ads.pipeline.maskers.matanyone_masker import MatAnyoneMasker
+
+        return MatAnyoneMasker(
+            device=kwargs.get("device"),
+            confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            reprompt_interval=kwargs.get("reprompt_interval", 0),
+            n_warmup=kwargs.get("n_warmup", 5),
+            use_yolo=kwargs.get("use_yolo", True),
+            checkpoint_path=kwargs.get("checkpoint_path"),
+            max_internal_size=kwargs.get("max_internal_size", -1),
+            box_padding=kwargs.get("box_padding", 10),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -919,6 +933,43 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=float,
         default=0.25,
         help="RVM internal downsample ratio (0.25 for HD, 0.125 for 4K; default: 0.25).",
+    )
+
+    # --- MatAnyone masker -------------------------------------------------
+    parser.add_argument(
+        "--matanyone_reprompt_interval",
+        type=int,
+        default=0,
+        help="MatAnyone: re-run person detection every N frames (0 = never; default: 0).",
+    )
+    parser.add_argument(
+        "--matanyone_n_warmup",
+        type=int,
+        default=5,
+        help="MatAnyone: warmup repetitions on first frame (default: 5).",
+    )
+    parser.add_argument(
+        "--matanyone_no_yolo",
+        action="store_true",
+        help="MatAnyone: disable YOLO, use Mask R-CNN for person detection.",
+    )
+    parser.add_argument(
+        "--matanyone_checkpoint",
+        type=str,
+        default=None,
+        help="MatAnyone: path to local .pth checkpoint (default: auto-download from HF Hub).",
+    )
+    parser.add_argument(
+        "--matanyone_max_size",
+        type=int,
+        default=-1,
+        help="MatAnyone: max internal resolution, longest side (-1 = no limit; default: -1).",
+    )
+    parser.add_argument(
+        "--matanyone_box_padding",
+        type=int,
+        default=10,
+        help="MatAnyone: padding on detection boxes for initial mask (default: 10).",
     )
 
     # --- Compositing / blend mode -----------------------------------------
@@ -1433,6 +1484,14 @@ def main() -> None:
             masker_kwargs.pop("confidence_threshold", None)
             masker_kwargs["backbone"] = args.rvm_backbone
             masker_kwargs["downsample_ratio"] = args.rvm_downsample_ratio
+        elif masker_name == "matanyone":
+            masker_kwargs["reprompt_interval"] = args.matanyone_reprompt_interval
+            masker_kwargs["n_warmup"] = args.matanyone_n_warmup
+            masker_kwargs["use_yolo"] = not args.matanyone_no_yolo
+            masker_kwargs["max_internal_size"] = args.matanyone_max_size
+            masker_kwargs["box_padding"] = args.matanyone_box_padding
+            if args.matanyone_checkpoint is not None:
+                masker_kwargs["checkpoint_path"] = args.matanyone_checkpoint
         logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,
@@ -1448,10 +1507,19 @@ def main() -> None:
 
     mask_smoother: MaskSmoother | None = None
     if masker_enabled:
-        mask_smoother = MaskSmoother(
-            close_px=args.mask_close_px,
-        )
-        logger.info("Mask smoother: close_px=%d", args.mask_close_px)
+        effective_close_px = args.mask_close_px
+        if masker_name in ("matanyone", "rvm") and effective_close_px == 7:
+            effective_close_px = 0
+            logger.info(
+                "MaskSmoother auto-disabled for '%s' (soft alpha). "
+                "Override with --mask_close_px N.",
+                masker_name,
+            )
+        if effective_close_px > 0:
+            mask_smoother = MaskSmoother(close_px=effective_close_px)
+            logger.info("Mask smoother: close_px=%d", effective_close_px)
+        else:
+            logger.info("Mask smoother: disabled (close_px=0)")
 
     if ad_enabled and masker_name == "none":
         logger.warning(

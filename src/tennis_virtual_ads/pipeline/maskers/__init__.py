@@ -18,4 +18,7 @@ from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker, OcclusionM
 # RVMMasker requires torch (heavy optional dependency).  Import explicitly:
 #   from tennis_virtual_ads.pipeline.maskers.rvm_masker import RVMMasker
 
+# MatAnyoneMasker requires matanyone + torch (heavy optional dependency).  Import explicitly:
+#   from tennis_virtual_ads.pipeline.maskers.matanyone_masker import MatAnyoneMasker
+
 __all__ = ["OcclusionMasker", "OcclusionMaskerResult"]
