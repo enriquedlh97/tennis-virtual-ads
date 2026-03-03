@@ -226,10 +226,11 @@ class SAM2VideoMasker(OcclusionMasker):
                 "SAM2VideoMasker: no persons detected on frame %d. All masks will be empty.",
                 self._prompt_frame_idx,
             )
-            # Store empty masks for all frames.
+            # Store empty masks for all frames (uint8 to save RAM).
             h, w = prompt_frame_bgr.shape[:2]
+            empty = np.zeros((h, w), dtype=np.uint8)
             for i in range(total_frames):
-                self._masks[i] = np.zeros((h, w), dtype=np.float32)
+                self._masks[i] = empty
         else:
             self._propagate_all(frame_dir, total_frames, boxes, prompt_frame_bgr)
 
@@ -253,7 +254,8 @@ class SAM2VideoMasker(OcclusionMasker):
         self._frame_count += 1
 
         if idx in self._masks:
-            m = self._masks[idx]
+            # Stored as uint8 (0/1) to save RAM; convert to float32 for API.
+            m = self._masks[idx].astype(np.float32)
             return OcclusionMaskerResult(
                 mask=m,
                 conf=1.0,
@@ -382,32 +384,43 @@ class SAM2VideoMasker(OcclusionMasker):
                     )
 
         # Propagate masks across all frames.
+        # Combine per-object masks into a union on-the-fly to avoid
+        # storing a separate dict of per-object masks (which would
+        # double RAM usage and OOM on longer videos).
+        # Masks are stored as uint8 (0/1) instead of float32 for 4x savings.
         logger.info(
             "SAM2VideoMasker: propagating masks across %d frames ...",
             total_frames,
         )
         prop_start = time.perf_counter()
+        empty_mask = np.zeros((frame_h, frame_w), dtype=np.uint8)
+        non_empty_count = 0
 
         with torch.inference_mode():
-            if str(self._device).startswith("cuda"):
-                with torch.autocast("cuda", dtype=torch.bfloat16):
-                    video_segments = {}
-                    for frame_idx, obj_ids, mask_logits in self._predictor.propagate_in_video(
-                        inference_state
-                    ):
-                        video_segments[frame_idx] = {
-                            oid: (mask_logits[i] > 0.0).cpu().numpy().astype(np.float32)
-                            for i, oid in enumerate(obj_ids)
-                        }
-            else:
-                video_segments = {}
-                for frame_idx, obj_ids, mask_logits in self._predictor.propagate_in_video(
+            ctx: Any = (
+                torch.autocast("cuda", dtype=torch.bfloat16)
+                if str(self._device).startswith("cuda")
+                else __import__("contextlib").nullcontext()
+            )
+
+            with ctx:
+                seen_frames: set[int] = set()
+                for fidx, _obj_ids, mask_logits in self._predictor.propagate_in_video(
                     inference_state
                 ):
-                    video_segments[frame_idx] = {
-                        oid: (mask_logits[i] > 0.0).cpu().numpy().astype(np.float32)
-                        for i, oid in enumerate(obj_ids)
-                    }
+                    seen_frames.add(fidx)
+                    # mask_logits: (num_objects, 1, H, W) on GPU.
+                    # Threshold → bool → squeeze → union → uint8, all in one pass.
+                    binary = (mask_logits > 0.0).squeeze(1)  # (N, H, W) bool on GPU
+                    union_gpu = binary.any(dim=0)  # (H, W) bool
+                    self._masks[fidx] = union_gpu.cpu().numpy().astype(np.uint8)
+                    if self._masks[fidx].any():
+                        non_empty_count += 1
+
+        # Fill any frames not returned by propagation with empty masks.
+        for fidx in range(total_frames):
+            if fidx not in seen_frames:
+                self._masks[fidx] = empty_mask
 
         prop_elapsed = time.perf_counter() - prop_start
         logger.info(
@@ -415,25 +428,10 @@ class SAM2VideoMasker(OcclusionMasker):
             prop_elapsed,
             total_frames / prop_elapsed if prop_elapsed > 0 else 0,
         )
-
-        # Combine per-object masks into a single union mask per frame.
-        for fidx in range(total_frames):
-            if fidx in video_segments:
-                obj_masks = list(video_segments[fidx].values())
-                if obj_masks:
-                    # Each mask is (1, H, W) — squeeze to (H, W) then union.
-                    squeezed = [np.squeeze(m) for m in obj_masks]
-                    union = np.maximum.reduce(squeezed)
-                    self._masks[fidx] = union.astype(np.float32)
-                else:
-                    self._masks[fidx] = np.zeros((frame_h, frame_w), dtype=np.float32)
-            else:
-                self._masks[fidx] = np.zeros((frame_h, frame_w), dtype=np.float32)
-
         logger.info(
             "SAM2VideoMasker: stored masks for %d frames (non-empty: %d)",
             total_frames,
-            sum(1 for m in self._masks.values() if m.max() > 0),
+            non_empty_count,
         )
 
         # Reset predictor state to free VRAM.
