@@ -28,7 +28,7 @@ set -euo pipefail
 # Source: https://drive.google.com/file/d/1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG
 GDRIVE_FILE_ID="1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG"
 OUTPUT_PATH="weights/tennis_court_detector.pt"
-MIN_SIZE_BYTES=100000000  # ~100 MB minimum (actual file is ~178 MB)
+MIN_SIZE_BYTES=40000000  # ~40 MB minimum (actual file is ~42 MB)
 
 # --------------------------------------------------------------------------
 # Helper
