@@ -10,6 +10,10 @@ the **entire** video at once:
 This gives the best possible smoothing (full future + past context) but
 requires two passes over the video (2x processing time).  Use for offline
 post-processing when maximum quality is needed.
+
+Smoothing is applied directly to the 9 entries of the normalised
+homography matrix (H[2,2]=1), avoiding lossy camera-parameter
+decomposition.
 """
 
 from __future__ import annotations
@@ -19,12 +23,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from tennis_virtual_ads.pipeline.temporal.homography_stabilizer import (
-    _decompose_homography_to_params,
-    _reconstruct_homography_from_params,
-)
-
 logger = logging.getLogger(__name__)
+
+
+def _normalise_h(H: np.ndarray) -> np.ndarray:
+    """Normalise a 3x3 homography so that H[2,2] = 1, return flat 9-vector."""
+    h = np.asarray(H, dtype=np.float64).ravel()
+    if abs(h[8]) > 1e-15:
+        h = h / h[8]
+    return h
 
 
 @dataclass
@@ -32,7 +39,7 @@ class _FrameRecord:
     """One frame's data collected during pass 1."""
 
     homography: np.ndarray | None
-    params: np.ndarray | None
+    h_vec: np.ndarray | None  # flat 9-vector or None
     is_cut: bool
 
 
@@ -45,21 +52,17 @@ class TwoPassSmoother:
         Savitzky-Golay window length (must be odd).  Default ``31``.
     polyorder : int
         Polynomial order.  Default ``3``.
-    image_center : tuple[float, float]
-        Image center for H decomposition.  Default ``(640.0, 360.0)``.
     """
 
     def __init__(
         self,
         window_length: int = 31,
         polyorder: int = 3,
-        image_center: tuple[float, float] = (640.0, 360.0),
     ) -> None:
         if window_length < 3 or window_length % 2 == 0:
             raise ValueError(f"window_length must be odd and >= 3, got {window_length}")
         self._window_length = window_length
         self._polyorder = polyorder
-        self._image_center = image_center
 
         self._records: list[_FrameRecord] = []
 
@@ -81,11 +84,11 @@ class TwoPassSmoother:
         is_cut : bool
             Whether a scene cut was detected at this frame.
         """
-        params: np.ndarray | None = None
+        h_vec: np.ndarray | None = None
         if homography is not None:
-            params = _decompose_homography_to_params(homography, self._image_center)
+            h_vec = _normalise_h(homography)
 
-        self._records.append(_FrameRecord(homography=homography, params=params, is_cut=is_cut))
+        self._records.append(_FrameRecord(homography=homography, h_vec=h_vec, is_cut=is_cut))
 
     @property
     def frame_count(self) -> int:
@@ -124,56 +127,49 @@ class TwoPassSmoother:
         result: list[np.ndarray | None] = [None] * n
 
         for seg_start, seg_end in segments:
-            # Collect valid indices and params within this segment.
+            # Collect valid indices and H vectors within this segment.
             valid_indices: list[int] = []
-            valid_params: list[np.ndarray] = []
+            valid_vecs: list[np.ndarray] = []
 
             for i in range(seg_start, seg_end):
                 rec = self._records[i]
-                if rec.params is not None:
+                if rec.h_vec is not None:
                     valid_indices.append(i)
-                    valid_params.append(rec.params)
+                    valid_vecs.append(rec.h_vec)
 
-            if len(valid_params) == 0:
-                # No valid frames in this segment.
+            if len(valid_vecs) == 0:
                 continue
 
-            if len(valid_params) == 1:
-                # Single valid frame -- no smoothing possible.
+            if len(valid_vecs) == 1:
                 idx = valid_indices[0]
                 result[idx] = self._records[idx].homography
                 continue
 
-            # Stack into (M, 3) array.
-            arr = np.array(valid_params)
+            # Stack into (M, 9) array.
+            arr = np.array(valid_vecs)
 
             # Determine effective window length.
-            wl = min(self._window_length, len(valid_params))
+            wl = min(self._window_length, len(valid_vecs))
             if wl % 2 == 0:
                 wl -= 1
             wl = max(wl, self._polyorder + 2)
-            if wl > len(valid_params):
-                # Can't smooth with this polyorder -- output raw.
+            if wl > len(valid_vecs):
+                # Can't smooth — output raw.
                 for _vi, idx in enumerate(valid_indices):
                     result[idx] = self._records[idx].homography
                 continue
 
             effective_po = min(self._polyorder, wl - 1)
 
-            # Apply savgol per channel.
+            # Apply savgol per channel (9 H entries).
             smoothed_arr = savgol_filter(arr, wl, effective_po, axis=0)
 
             # Reconstruct H for each valid frame.
             for vi, idx in enumerate(valid_indices):
-                smoothed_params = smoothed_arr[vi]
-                H_s = _reconstruct_homography_from_params(smoothed_params, self._image_center)
+                H_s = smoothed_arr[vi].reshape(3, 3)
                 if abs(H_s[2, 2]) > 1e-12:
                     H_s = H_s / H_s[2, 2]
-                result[idx] = np.asarray(H_s)
-
-            # For invalid frames within the segment that are surrounded
-            # by valid ones, we leave them as None (the caller should
-            # handle this via hold logic or skip).
+                result[idx] = np.asarray(H_s, dtype=np.float64)
 
         logger.info(
             "Two-pass smooth: %d frames, %d segments, window=%d, polyorder=%d",

@@ -13,10 +13,9 @@ How it works
 4. At end of video, :meth:`flush` drains remaining frames with shrinking
    future context.
 
-The filter is Savitzky-Golay applied independently to each decomposed
-camera parameter ``[pan, tilt, focal]``.  Savitzky-Golay fits a local
-polynomial (order 3) to the data in the window -- it smooths noise while
-preserving the shape of genuine camera motion (pans, tilts, zooms).
+The filter is Savitzky-Golay applied independently to each of the 8
+free entries of the normalised homography matrix (H[2,2]=1).  This
+avoids lossy decomposition into camera parameters.
 
 Scene cuts split the smoothing window so that no smoothing crosses a cut
 boundary.
@@ -29,12 +28,15 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from tennis_virtual_ads.pipeline.temporal.homography_stabilizer import (
-    _decompose_homography_to_params,
-    _reconstruct_homography_from_params,
-)
-
 logger = logging.getLogger(__name__)
+
+
+def _normalise_h(H: np.ndarray) -> np.ndarray:
+    """Normalise a 3x3 homography so that H[2,2] = 1."""
+    h = np.asarray(H, dtype=np.float64).ravel()
+    if abs(h[8]) > 1e-15:
+        h = h / h[8]
+    return h  # flat 9-vector
 
 
 @dataclass
@@ -42,56 +44,35 @@ class _FrameEntry:
     """One buffered frame's homography data."""
 
     homography: np.ndarray | None
-    params: np.ndarray | None  # [pan, tilt, focal] or None if decomposition failed
+    h_vec: np.ndarray | None  # flat 9-vector (normalised) or None
     is_cut: bool
 
 
-def _savgol_smooth_params(
-    params_sequence: list[np.ndarray],
+def _savgol_smooth(
+    vectors: list[np.ndarray],
     polyorder: int = 3,
     center_idx: int | None = None,
 ) -> np.ndarray:
-    """Apply Savitzky-Golay smoothing to a sequence of camera params.
+    """Apply Savitzky-Golay smoothing to a sequence of vectors.
 
-    Returns the smoothed params for the center frame (or *center_idx* if
-    specified).
-
-    Parameters
-    ----------
-    params_sequence : list[np.ndarray]
-        Each element is ``[pan, tilt, focal]``.
-    polyorder : int
-        Polynomial order for Savitzky-Golay.
-    center_idx : int | None
-        Index of the frame to return.  Defaults to the middle element.
-
-    Returns
-    -------
-    np.ndarray
-        Smoothed ``[pan, tilt, focal]`` for the target frame.
+    Returns the smoothed vector for the center frame (or *center_idx*).
     """
     from scipy.signal import savgol_filter
 
-    n = len(params_sequence)
+    n = len(vectors)
     if center_idx is None:
         center_idx = n // 2
 
-    # Stack into (N, 3) array.
-    arr = np.array(params_sequence)  # (N, 3)
+    arr = np.array(vectors)  # (N, D)
 
     # Window length must be odd and <= n.
     window_length = n if n % 2 == 1 else n - 1
     window_length = max(window_length, polyorder + 2)
     if window_length > n:
-        # Not enough data for the requested polyorder -- return raw.
         return np.array(arr[center_idx], copy=True)
 
-    # Clamp polyorder if window is small.
     effective_polyorder = min(polyorder, window_length - 1)
-
-    # Apply savgol independently per channel.
     smoothed = savgol_filter(arr, window_length, effective_polyorder, axis=0)
-
     return np.array(smoothed[center_idx], copy=True)
 
 
@@ -100,7 +81,7 @@ class LookaheadSmoother:
 
     Each :meth:`push` call appends one frame.  Once there are ``lookahead``
     future frames available for the next-to-output frame, a smoothed
-    homography is returned.  This gives a consistent 1:1 input→output
+    homography is returned.  This gives a consistent 1:1 input/output
     ratio after the initial delay, making external frame-buffer
     synchronisation trivial.
 
@@ -111,21 +92,17 @@ class LookaheadSmoother:
         value.  Default ``10`` (~333ms at 30fps).
     polyorder : int
         Savitzky-Golay polynomial order.  Default ``3``.
-    image_center : tuple[float, float]
-        Image center for H decomposition.  Default ``(640.0, 360.0)``.
     """
 
     def __init__(
         self,
         lookahead: int = 10,
         polyorder: int = 3,
-        image_center: tuple[float, float] = (640.0, 360.0),
     ) -> None:
         if lookahead < 1:
             raise ValueError(f"lookahead must be >= 1, got {lookahead}")
         self._lookahead = lookahead
         self._polyorder = polyorder
-        self._image_center = image_center
 
         self._entries: list[_FrameEntry] = []
         self._next_output: int = 0  # Index of next frame to output.
@@ -167,14 +144,13 @@ class LookaheadSmoother:
             ``self._next_output``, or ``None`` if not enough future
             context has accumulated yet.
         """
-        params: np.ndarray | None = None
+        h_vec: np.ndarray | None = None
         if homography is not None:
-            params = _decompose_homography_to_params(homography, self._image_center)
+            h_vec = _normalise_h(homography)
 
-        self._entries.append(_FrameEntry(homography=homography, params=params, is_cut=is_cut))
+        self._entries.append(_FrameEntry(homography=homography, h_vec=h_vec, is_cut=is_cut))
 
         # Check if the next-to-output frame has enough future context.
-        # It needs at least `lookahead` frames after it.
         future_available = len(self._entries) - 1 - self._next_output
         if future_available >= self._lookahead:
             result = self._smooth_entry(self._next_output)
@@ -220,7 +196,7 @@ class LookaheadSmoother:
         target_entry = self._entries[target_idx]
 
         # If the target has no valid H, return None.
-        if target_entry.homography is None or target_entry.params is None:
+        if target_entry.homography is None or target_entry.h_vec is None:
             return None
 
         # Determine context window: up to lookahead in each direction.
@@ -228,39 +204,36 @@ class LookaheadSmoother:
         window_end = min(n - 1, target_idx + self._lookahead)
 
         # Narrow window to not cross scene cuts.
-        # Expand left: stop if a cut is encountered (a cut at index i
-        # means i is the first frame of the new segment).
         for i in range(target_idx - 1, window_start - 1, -1):
             if self._entries[i + 1].is_cut:
                 window_start = i + 1
                 break
 
-        # Expand right: stop if a cut is encountered.
         for i in range(target_idx + 1, window_end + 1):
             if self._entries[i].is_cut:
                 window_end = i - 1
                 break
 
-        # Collect valid params in the window.
+        # Collect valid H vectors in the window.
         valid_indices: list[int] = []
-        valid_params: list[np.ndarray] = []
+        valid_vecs: list[np.ndarray] = []
         for i in range(window_start, window_end + 1):
             entry = self._entries[i]
-            if entry.params is not None:
+            if entry.h_vec is not None:
                 valid_indices.append(i)
-                valid_params.append(entry.params)
+                valid_vecs.append(entry.h_vec)
 
-        if len(valid_params) < 2:
-            # Not enough context to smooth -- return the raw H.
+        if len(valid_vecs) < 2:
+            # Not enough context — return raw H.
             return (
                 np.array(target_entry.homography, copy=True)
                 if target_entry.homography is not None
                 else None
             )
 
-        # Find where the target sits in the valid_params list.
+        # Find where the target sits in the valid list.
         try:
-            target_pos_in_valid = valid_indices.index(target_idx)
+            target_pos = valid_indices.index(target_idx)
         except ValueError:
             return (
                 np.array(target_entry.homography, copy=True)
@@ -268,15 +241,15 @@ class LookaheadSmoother:
                 else None
             )
 
-        smoothed_params = _savgol_smooth_params(
-            valid_params,
+        smoothed_vec = _savgol_smooth(
+            valid_vecs,
             polyorder=self._polyorder,
-            center_idx=target_pos_in_valid,
+            center_idx=target_pos,
         )
 
-        # Reconstruct H from smoothed params.
-        H_smoothed = _reconstruct_homography_from_params(smoothed_params, self._image_center)
+        # Reshape back to 3x3 and normalise.
+        H_smoothed = smoothed_vec.reshape(3, 3)
         if abs(H_smoothed[2, 2]) > 1e-12:
             H_smoothed = H_smoothed / H_smoothed[2, 2]
 
-        return np.asarray(H_smoothed)
+        return np.asarray(H_smoothed, dtype=np.float64)

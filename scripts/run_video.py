@@ -1352,13 +1352,6 @@ def main() -> None:
         output_width = resize[0] if resize else reader.width
         output_height = resize[1] if resize else reader.height
 
-        # Set correct image center for H decomposition now that we know resolution.
-        _image_center = (output_width / 2.0, output_height / 2.0)
-        if lookahead_smoother is not None:
-            lookahead_smoother._image_center = _image_center
-        if two_pass_smoother is not None:
-            two_pass_smoother._image_center = _image_center
-
         with VideoWriter(
             args.output,
             fps=reader.fps,
