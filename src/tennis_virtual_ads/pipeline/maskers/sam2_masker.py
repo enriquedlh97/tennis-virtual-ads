@@ -427,7 +427,7 @@ class SAM2Masker(OcclusionMasker):
         # previous binary mask and convert to logit-like values.
         mask_resized = _cv2.resize(self._prev_mask, (256, 256), interpolation=_cv2.INTER_LINEAR)
         # Convert [0,1] binary mask to logit-scale: positive = foreground.
-        mask_logits = (mask_resized * 20.0 - 10.0).astype(np.float32)
+        mask_logits = (mask_resized * 12.0 - 6.0).astype(np.float32)
         mask_input = mask_logits[np.newaxis, :, :]  # (1, 256, 256)
 
         with torch.inference_mode():

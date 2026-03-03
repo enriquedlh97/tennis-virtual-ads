@@ -66,6 +66,7 @@ from tennis_virtual_ads.pipeline.placer.placement import (  # noqa: E402
 )
 from tennis_virtual_ads.pipeline.temporal.jitter_tracker import JitterTracker  # noqa: E402
 from tennis_virtual_ads.pipeline.temporal.keypoint_smoother import KeypointSmoother  # noqa: E402
+from tennis_virtual_ads.pipeline.temporal.mask_smoother import MaskSmoother  # noqa: E402
 from tennis_virtual_ads.utils.draw import (  # noqa: E402
     STATUS_FAIL_COLOR,
     STATUS_OK_COLOR,
@@ -795,9 +796,9 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--mask_dilate_px",
         type=int,
-        default=3,
+        default=15,
         help=(
-            "Pixels to dilate the occlusion mask by (covers rackets near body; default: 3). "
+            "Pixels to dilate the occlusion mask by (covers rackets near body; default: 15). "
             "Use 5-8 for Mask R-CNN to reduce halo artifacts."
         ),
     )
@@ -806,6 +807,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Show a mask preview overlay in the bottom-right corner of the output.",
+    )
+    parser.add_argument(
+        "--mask_ema_alpha",
+        type=float,
+        default=0.5,
+        help="EMA blending factor for temporal mask smoothing (0=max smooth, 1=no smooth; default: 0.5).",
+    )
+    parser.add_argument(
+        "--mask_close_px",
+        type=int,
+        default=7,
+        help="Morphological close kernel radius for mask hole-filling (0=disable; default: 7).",
     )
     parser.add_argument(
         "--sam2_reprompt_interval",
@@ -1326,6 +1339,18 @@ def main() -> None:
             mask_debug,
         )
 
+    mask_smoother: MaskSmoother | None = None
+    if masker_enabled:
+        mask_smoother = MaskSmoother(
+            alpha=args.mask_ema_alpha,
+            close_px=args.mask_close_px,
+        )
+        logger.info(
+            "Mask smoother: alpha=%.2f  close_px=%d",
+            args.mask_ema_alpha,
+            args.mask_close_px,
+        )
+
     if ad_enabled and masker_name == "none":
         logger.warning(
             "Ad placement is enabled but no occlusion masker is active. "
@@ -1488,6 +1513,8 @@ def main() -> None:
                 # Deferred masker reset for lookahead / two-pass modes.
                 if state.is_cut and masker is not None and hasattr(masker, "reset_on_cut"):
                     masker.reset_on_cut()
+                if state.is_cut and mask_smoother is not None:
+                    mask_smoother.reset()
 
                 # HUD: calibration status.
                 if state.calibration_result is not None:
@@ -1516,6 +1543,8 @@ def main() -> None:
                     masker_result = masker.mask(frame)
                     occlusion_mask = masker_result["mask"]
                     mask_instance_count = masker_result["debug"].get("instance_count", 0)
+                    if mask_smoother is not None:
+                        occlusion_mask = mask_smoother.update(occlusion_mask)
                     if mask_dilate_px > 0 and np.any(occlusion_mask > 0):
                         dilate_kernel = cv2.getStructuringElement(
                             cv2.MORPH_ELLIPSE,

@@ -7,6 +7,7 @@ from tennis_virtual_ads.pipeline.temporal.jitter_tracker import JitterTracker
 from tennis_virtual_ads.pipeline.temporal.keypoint_smoother import KeypointSmoother
 from tennis_virtual_ads.pipeline.temporal.keypoint_tracker import KeypointTracker
 from tennis_virtual_ads.pipeline.temporal.lookahead_smoother import LookaheadSmoother
+from tennis_virtual_ads.pipeline.temporal.mask_smoother import MaskSmoother
 from tennis_virtual_ads.pipeline.temporal.stability_metrics import StabilityCollector
 from tennis_virtual_ads.pipeline.temporal.two_pass_smoother import TwoPassSmoother
 
@@ -18,6 +19,7 @@ __all__ = [
     "KeypointSmoother",
     "KeypointTracker",
     "LookaheadSmoother",
+    "MaskSmoother",
     "StabilityCollector",
     "TwoPassSmoother",
 ]
