@@ -229,8 +229,8 @@ class MatAnyoneMasker(OcclusionMasker):
 
         # --- Prepare tensors -------------------------------------------------
         image_tensor = self._frame_to_tensor(frame)
-        # Index mask: 0 = background, 1 = object 1.
-        mask_tensor = torch.from_numpy(binary_mask).to(self._device).gt(127).to(torch.uint8)
+        # Mask as 0/255 float — matches MatAnyone's process_video convention.
+        mask_tensor = torch.from_numpy(binary_mask).float().to(self._device)
 
         # Optionally resize for VRAM savings.
         image_tensor, mask_tensor, scale = self._maybe_resize(image_tensor, mask_tensor)
@@ -238,11 +238,9 @@ class MatAnyoneMasker(OcclusionMasker):
         # --- Initialize MatAnyone --------------------------------------------
         self._processor.clear_memory()
 
-        # First call: provide index mask + objects to initialize.
+        # First call: provide mask + objects to initialize.
         with torch.inference_mode():
-            output_prob = self._processor.step(
-                image_tensor, mask_tensor, objects=[1], idx_mask=True
-            )
+            output_prob = self._processor.step(image_tensor, mask_tensor, objects=[1])
             # Second call: first_frame_pred to seed memory.
             output_prob = self._processor.step(image_tensor, first_frame_pred=True)
 
