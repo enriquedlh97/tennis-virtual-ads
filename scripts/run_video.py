@@ -489,6 +489,7 @@ MASKER_NAMES: list[str] = [
     "matanyone",
     "depth",
     "matanyone_hybrid",
+    "sam2_video",
 ]
 
 
@@ -603,6 +604,19 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             max_internal_size=kwargs.get("max_internal_size", -1),
             box_padding=kwargs.get("box_padding", 10),
             flow_scale=kwargs.get("flow_scale", 0.5),
+        )
+
+    if name == "sam2_video":
+        from tennis_virtual_ads.pipeline.maskers.sam2_video_masker import SAM2VideoMasker
+
+        return SAM2VideoMasker(
+            video_path=kwargs.get("video_path"),  # type: ignore[arg-type]
+            device=kwargs.get("device"),
+            model_cfg=kwargs.get("model_cfg", "sam2.1_hiera_l"),
+            checkpoint_path=kwargs.get("checkpoint_path"),
+            confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            use_yolo=kwargs.get("use_yolo", True),
+            prompt_frame_idx=kwargs.get("prompt_frame_idx", 0),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -1159,6 +1173,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Path to SAM2 checkpoint file (default: weights/sam2.1_hiera_small.pt).",
     )
 
+    # --- SAM2 video predictor masker --------------------------------------
+    parser.add_argument(
+        "--sam2v_model_cfg",
+        type=str,
+        default="sam2.1_hiera_l",
+        choices=["sam2.1_hiera_t", "sam2.1_hiera_s", "sam2.1_hiera_b+", "sam2.1_hiera_l"],
+        help="SAM2 video predictor model size (default: sam2.1_hiera_l).",
+    )
+    parser.add_argument(
+        "--sam2v_checkpoint",
+        type=str,
+        default=None,
+        help="Path to local SAM2 checkpoint for video predictor (default: auto-download from HF).",
+    )
+    parser.add_argument(
+        "--sam2v_prompt_frame",
+        type=int,
+        default=0,
+        help="Frame index for auto-detecting persons in sam2_video masker (default: 0).",
+    )
+
     # --- Stability metrics ------------------------------------------------
     parser.add_argument(
         "--stability_json",
@@ -1586,6 +1621,13 @@ def main() -> None:
             masker_kwargs["box_padding"] = args.matanyone_box_padding
             if args.matanyone_checkpoint is not None:
                 masker_kwargs["checkpoint_path"] = args.matanyone_checkpoint
+        elif masker_name == "sam2_video":
+            masker_kwargs["video_path"] = args.input
+            masker_kwargs["model_cfg"] = args.sam2v_model_cfg
+            masker_kwargs["use_yolo"] = not args.sam2_no_yolo
+            masker_kwargs["prompt_frame_idx"] = args.sam2v_prompt_frame
+            if args.sam2v_checkpoint is not None:
+                masker_kwargs["checkpoint_path"] = args.sam2v_checkpoint
         logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,
@@ -1603,7 +1645,7 @@ def main() -> None:
     if masker_enabled:
         effective_close_px = args.mask_close_px
         if (
-            masker_name in ("matanyone", "rvm", "depth", "matanyone_hybrid")
+            masker_name in ("matanyone", "rvm", "depth", "matanyone_hybrid", "sam2_video")
             and effective_close_px == 7
         ):
             effective_close_px = 0

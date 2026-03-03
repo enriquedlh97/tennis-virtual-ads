@@ -23,6 +23,7 @@ sam2 = [
     "torch>=2.0",
     "torchvision>=0.17",
     "sam2>=1.0",
+    "huggingface-hub>=0.20",
 ]
 yolo = [
     "ultralytics>=8.0",

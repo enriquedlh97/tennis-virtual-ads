@@ -2356,6 +2356,7 @@ occlusion = [
     { name = "torchvision" },
 ]
 sam2 = [
+    { name = "huggingface-hub" },
     { name = "sam2" },
     { name = "torch" },
     { name = "torchvision" },
@@ -2369,6 +2370,7 @@ requires-dist = [
     { name = "chardet", marker = "extra == 'matanyone'", specifier = ">=5.0" },
     { name = "coverage", marker = "extra == 'dev'", specifier = ">=7.0" },
     { name = "huggingface-hub", marker = "extra == 'matanyone'", specifier = ">=0.20" },
+    { name = "huggingface-hub", marker = "extra == 'sam2'", specifier = ">=0.20" },
     { name = "imageio", marker = "extra == 'matanyone'", specifier = ">=2.30" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "opencv-contrib-python", marker = "extra == 'guided-filter'", specifier = ">=4.8.0" },
