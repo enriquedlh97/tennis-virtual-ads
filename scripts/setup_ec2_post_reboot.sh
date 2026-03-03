@@ -70,6 +70,15 @@ info "3/8  Installing Python dependencies"
 uv sync --all-extras
 pass "uv sync complete (venv created at .venv/)"
 
+# MatAnyone has a transitive dep on cchardet which fails to build on Python 3.12
+# (longintrepr.h removed). Install chardet as drop-in, then matanyone without deps,
+# then the runtime deps it actually needs.
+echo "  Installing MatAnyone (video matting) ..."
+uv pip install chardet
+uv pip install --no-deps git+https://github.com/pq-yang/MatAnyone.git
+uv pip install imageio huggingface-hub safetensors
+pass "MatAnyone installed"
+
 # --------------------------------------------------------------------------
 # 4. Download model weights
 # --------------------------------------------------------------------------
