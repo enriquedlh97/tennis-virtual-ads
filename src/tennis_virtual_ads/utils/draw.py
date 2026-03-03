@@ -61,7 +61,7 @@ def project_point(homography: np.ndarray, point: tuple[int, int]) -> tuple[int, 
     if abs(projected[2]) < 1e-10:
         return None
     projected /= projected[2]
-    return (round(projected[0]), round(projected[1]))
+    return (round(float(projected[0])), round(float(projected[1])))
 
 
 # ---------------------------------------------------------------------------
