@@ -150,9 +150,10 @@ class SAM2Masker(OcclusionMasker):
             device=str(self._device),
         )
 
-        # FP16 inference on CUDA for memory savings (fits T4 16GB).
-        if self._device.type == "cuda":
-            self._sam2_model.half()
+        # Use autocast for FP16 inference on CUDA (fits T4 16GB).
+        # Don't call .half() — it causes dtype mismatches when
+        # set_image feeds float32 inputs into float16 conv layers.
+        self._use_autocast = self._device.type == "cuda"
 
         self._sam2_predictor = SAM2ImagePredictor(self._sam2_model)
 
@@ -355,12 +356,15 @@ class SAM2Masker(OcclusionMasker):
 
         # SAM2 expects RGB.
         rgb = frame[:, :, ::-1].copy()
-        self._sam2_predictor.set_image(rgb)
 
         # Process all boxes together.
         input_boxes = np.array(boxes, dtype=np.float32)
 
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            torch.autocast(str(self._device), dtype=torch.float16, enabled=self._use_autocast),
+        ):
+            self._sam2_predictor.set_image(rgb)
             masks, scores, _ = self._sam2_predictor.predict(
                 box=input_boxes,
                 multimask_output=False,
@@ -400,7 +404,6 @@ class SAM2Masker(OcclusionMasker):
             return np.zeros((frame_height, frame_width), dtype=np.float32), 0.0
 
         rgb = frame[:, :, ::-1].copy()
-        self._sam2_predictor.set_image(rgb)
 
         # SAM2 expects mask_input as (1, 256, 256) logits — resize the
         # previous binary mask and convert to logit-like values.
@@ -409,7 +412,11 @@ class SAM2Masker(OcclusionMasker):
         mask_logits = (mask_resized * 20.0 - 10.0).astype(np.float32)
         mask_input = mask_logits[np.newaxis, :, :]  # (1, 256, 256)
 
-        with torch.inference_mode():
+        with (
+            torch.inference_mode(),
+            torch.autocast(str(self._device), dtype=torch.float16, enabled=self._use_autocast),
+        ):
+            self._sam2_predictor.set_image(rgb)
             masks, scores, _ = self._sam2_predictor.predict(
                 mask_input=mask_input,
                 multimask_output=False,
