@@ -108,6 +108,7 @@ class YOLOSegMasker(OcclusionMasker):
             classes=[_COCO_PERSON_CLASS],
             conf=self._confidence_threshold,
             device=self._device,
+            retina_masks=True,
         )
 
         result = results[0]
