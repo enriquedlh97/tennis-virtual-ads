@@ -44,8 +44,8 @@ class HomographyLocker:
     def __init__(
         self,
         reference_points: np.ndarray,
-        lock_threshold: float = 0.5,
-        unlock_threshold: float = 2.0,
+        lock_threshold: float = 1.5,
+        unlock_threshold: float = 10.0,
         lock_patience: int = 5,
     ) -> None:
         self._reference_points = reference_points.astype(np.float32)
@@ -58,6 +58,11 @@ class HomographyLocker:
         self._consecutive_static: int = 0
         self._frames_locked: int = 0
         self._last_displacement: float = 0.0
+        self._total_frames: int = 0
+        self._total_locked: int = 0
+        self._period_frames: int = 0
+        self._period_locked: int = 0
+        self._period_disp_sum: float = 0.0
 
     # --- Public properties ---------------------------------------------------
 
@@ -98,11 +103,18 @@ class HomographyLocker:
         np.ndarray | None
             The (possibly locked) homography to use for rendering.
         """
+        self._total_frames += 1
+        self._period_frames += 1
+
         if homography is None:
             if self._is_locked:
                 # Camera didn't move (calibration dropout) -- return locked H.
                 self._frames_locked += 1
+                self._total_locked += 1
+                self._period_locked += 1
+                self._log_periodic()
                 return self._locked_H
+            self._log_periodic()
             return None
 
         if self._locked_H is None:
@@ -116,42 +128,68 @@ class HomographyLocker:
 
         if self._is_locked:
             # --- LOCKED state ---
+            self._period_disp_sum += displacement
             if displacement > self._unlock_threshold:
                 # Camera started moving -- unlock.
                 self._is_locked = False
                 self._locked_H = homography.copy()
                 self._consecutive_static = 0
                 self._frames_locked = 0
-                logger.debug(
-                    "H-locker UNLOCKED: displacement=%.2fpx > threshold=%.2fpx",
+                logger.info(
+                    "H-locker UNLOCKED (frame %d): displacement=%.2fpx > threshold=%.2fpx",
+                    self._total_frames,
                     displacement,
                     self._unlock_threshold,
                 )
+                self._log_periodic()
                 return homography
             else:
                 # Still static -- return locked H.
                 self._frames_locked += 1
+                self._total_locked += 1
+                self._period_locked += 1
+                self._log_periodic()
                 return self._locked_H
         else:
             # --- UNLOCKED state ---
+            self._period_disp_sum += displacement
             if displacement < self._lock_threshold:
                 self._consecutive_static += 1
                 if self._consecutive_static >= self._lock_patience:
                     # Lock!
                     self._is_locked = True
                     self._frames_locked = 1
-                    logger.debug(
-                        "H-locker LOCKED: %d consecutive frames < %.2fpx",
+                    self._total_locked += 1
+                    self._period_locked += 1
+                    logger.info(
+                        "H-locker LOCKED (frame %d): %d consecutive frames < %.2fpx",
+                        self._total_frames,
                         self._consecutive_static,
                         self._lock_threshold,
                     )
+                    self._log_periodic()
                     return self._locked_H
             else:
                 self._consecutive_static = 0
 
             # Track latest H as the reference while unlocked.
             self._locked_H = homography.copy()
+            self._log_periodic()
             return homography
+
+    def _log_periodic(self) -> None:
+        """Log a summary every 100 frames."""
+        if self._period_frames > 0 and self._period_frames % 100 == 0:
+            mean_disp = self._period_disp_sum / self._period_frames
+            logger.info(
+                "H-locker: locked %d/%d frames, disp=%.1fpx",
+                self._period_locked,
+                self._period_frames,
+                mean_disp,
+            )
+            self._period_frames = 0
+            self._period_locked = 0
+            self._period_disp_sum = 0.0
 
     def reset(self) -> None:
         """Reset all state (call on scene cuts)."""

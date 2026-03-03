@@ -810,8 +810,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--sam2_reprompt_interval",
         type=int,
-        default=100,
-        help="Re-run person detection for SAM2 prompting every N frames (default: 100).",
+        default=5,
+        help="Re-run person detection for SAM2 prompting every N frames (default: 5).",
     )
     parser.add_argument(
         "--sam2_no_yolo",
@@ -904,14 +904,14 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--lock_threshold",
         type=float,
-        default=0.5,
-        help="Mean displacement (px) below which a frame is considered static (default: 0.5).",
+        default=1.5,
+        help="Mean displacement (px) below which a frame is considered static (default: 1.5).",
     )
     parser.add_argument(
         "--unlock_threshold",
         type=float,
-        default=2.0,
-        help="Mean displacement (px) above which a locked H is released (default: 2.0).",
+        default=10.0,
+        help="Mean displacement (px) above which a locked H is released (default: 10.0).",
     )
     parser.add_argument(
         "--lock_patience",

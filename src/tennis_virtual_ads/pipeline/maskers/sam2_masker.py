@@ -87,7 +87,7 @@ class SAM2Masker(OcclusionMasker):
         Minimum detection score for prompting detections.  Default ``0.5``.
     reprompt_interval : int
         Re-run person detection every N frames to catch new players
-        entering the scene.  Default ``100``.
+        entering the scene.  Default ``5``.
     use_yolo : bool
         Use YOLO11 for prompting (if available).  Falls back to Mask R-CNN
         if YOLO is unavailable or ``use_yolo=False``.  Default ``True``.
@@ -103,7 +103,7 @@ class SAM2Masker(OcclusionMasker):
         checkpoint_path: str | None = None,
         device: str | None = None,
         confidence_threshold: float = 0.5,
-        reprompt_interval: int = 100,
+        reprompt_interval: int = 5,
         use_yolo: bool = True,
         yolo_model: str = "yolo11n.pt",
         offload_to_cpu: bool = True,
