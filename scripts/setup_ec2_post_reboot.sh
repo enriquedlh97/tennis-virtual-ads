@@ -99,6 +99,11 @@ else
         fail "Download failed — $VIDEOS_ZIP not found"
     fi
 
+    if ! command -v unzip &> /dev/null; then
+        echo "  Installing unzip..."
+        sudo apt install -y unzip
+    fi
+
     echo "  Unzipping into $VIDEOS_DIR ..."
     mkdir -p "$VIDEOS_DIR"
     unzip -o "$VIDEOS_ZIP" -d "$VIDEOS_DIR"
