@@ -173,11 +173,9 @@ class SAM2Masker(OcclusionMasker):
             device=str(self._device),
         )
 
-        # Use autocast for FP16 inference on CUDA (fits T4 16GB).
-        # Don't call .half() — it causes dtype mismatches when
-        # set_image feeds float32 inputs into float16 conv layers.
-        self._use_autocast = self._device.type == "cuda"
-
+        # Run in float32 — the small model (46M params) fits T4 16GB
+        # without half precision.  Both .half() and autocast cause issues
+        # with SAM2's internal buffers producing empty/incorrect masks.
         self._sam2_predictor = SAM2ImagePredictor(self._sam2_model)
 
         load_elapsed = time.perf_counter() - load_start
@@ -383,10 +381,7 @@ class SAM2Masker(OcclusionMasker):
         # Process all boxes together.
         input_boxes = np.array(boxes, dtype=np.float32)
 
-        with (
-            torch.inference_mode(),
-            torch.autocast(str(self._device), dtype=torch.float16, enabled=self._use_autocast),
-        ):
+        with torch.inference_mode():
             self._sam2_predictor.set_image(rgb)
             masks, scores, _ = self._sam2_predictor.predict(
                 box=input_boxes,
@@ -435,10 +430,7 @@ class SAM2Masker(OcclusionMasker):
         mask_logits = (mask_resized * 20.0 - 10.0).astype(np.float32)
         mask_input = mask_logits[np.newaxis, :, :]  # (1, 256, 256)
 
-        with (
-            torch.inference_mode(),
-            torch.autocast(str(self._device), dtype=torch.float16, enabled=self._use_autocast),
-        ):
+        with torch.inference_mode():
             self._sam2_predictor.set_image(rgb)
             masks, scores, _ = self._sam2_predictor.predict(
                 mask_input=mask_input,
