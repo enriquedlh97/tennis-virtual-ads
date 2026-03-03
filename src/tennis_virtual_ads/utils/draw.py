@@ -56,12 +56,21 @@ def project_point(homography: np.ndarray, point: tuple[int, int]) -> tuple[int, 
         Projected ``(x, y)`` in the target coordinate system, or ``None``
         if the point projects to infinity (``w ~ 0``).
     """
+    H = np.asarray(homography, dtype=np.float64).reshape(3, 3)
     point_homogeneous = np.array([point[0], point[1], 1.0], dtype=np.float64)
-    projected = homography @ point_homogeneous
-    if abs(projected[2]) < 1e-10:
+    projected = H @ point_homogeneous
+    w = float(projected[2])
+    if abs(w) < 1e-10:
         return None
-    projected /= projected[2]
-    return (round(projected[0]), round(projected[1]))
+    x = float(projected[0]) / w
+    y = float(projected[1]) / w
+    if not (np.isfinite(x) and np.isfinite(y)):
+        return None
+    # Clamp to OpenCV int32 range to avoid overflow.
+    _LIMIT = 2**30
+    xi = max(-_LIMIT, min(_LIMIT, round(x)))
+    yi = max(-_LIMIT, min(_LIMIT, round(y)))
+    return (xi, yi)
 
 
 # ---------------------------------------------------------------------------

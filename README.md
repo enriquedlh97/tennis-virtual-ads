@@ -16,6 +16,8 @@ Setup requires a reboot (NVIDIA driver), so it's split into two scripts.
 # Connect
 ssh -A -i ~/repositories/CS265-mlsys-project/cs265-ed25519.pem ubuntu@ec2-3-236-216-236.compute-1.amazonaws.com
 
+ssh -A -i ~/repositories/CS265-mlsys-project/cs265-ed25519.pem ubuntu@ec2-18-207-159-83.compute-1.amazonaws.com
+
 # Phase 1 (first time only — ~2-3 min, then reboots)
 mkdir -p ~/capstone-repos && cd ~/capstone-repos
 git clone git@github.com:enriquedlh97/tennis-virtual-ads.git

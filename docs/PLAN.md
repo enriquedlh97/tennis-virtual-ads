@@ -12,6 +12,9 @@
 - [x] **Step 6A** — HomographyStabilizer v1 (EMA in H-space + hold-last-good + config-switch guard)
 - [x] **Step 3B** — Scene-cut detection (frame diff + projection jump + cooldown)
 - [x] **Step 5A** — OcclusionMasker v1 (players only — Mask R-CNN person segmentation + ad occlusion)
+- [x] **Step 5A.1** — ColorKeyMasker (HSV court-color keying, pure OpenCV, sub-1ms)
+- [ ] **Step 5A.2** — Soft HSV distance keying upgrade (continuous alpha, guided filter refinement)
+- [ ] **Step 5A.3** — Production matting model (MODNet / RVM — learned alpha mattes)
 - [ ] **Step 5B** — OcclusionMasker v2 (ball / net / shadows)
 - [x] **Step 7A** — Painted-look compositing v1 (shadow-preserving blend)
 - [ ] **Step 8** — Debug views
@@ -872,3 +875,125 @@ Start with generic person segmentation and make the pipeline work end-to-end.
 * Don't optimize to 30 fps before you have correct geometry + occlusion.
 * Don't refactor repos into your repo; wrap them behind interfaces.
 ---
+
+## Step 5A — Occlusion Masking Roadmap (Production-Grade)
+
+### Problem
+
+ML segmentation maskers (YOLO-seg, SAM2, Mask R-CNN) produce binary masks that
+struggle with motion-blurred broadcast frames — the player's blur fringe bleeds
+through the ad. The ColorKeyMasker (HSV court-color keying) improved this but
+still fails on blurred edges because binary `inRange()` classifies blended
+pixels as either court or player, with no middle ground.
+
+### Industry research (March 2026)
+
+Deep research into production broadcast systems (Supponor/TGI Sport, Viz Arena,
+AIM Sport, Chyron) revealed:
+
+1. **The industry is converging on learned alpha matting**, not instance
+   segmentation or chroma keying. Supponor/TGI Sport's AI researcher lists
+   "image matting" as her primary expertise. Matting produces continuous alpha
+   values (0.0-1.0) that inherently handle motion blur, hair, racket strings,
+   and soft edges.
+
+2. **No production system uses SAM2 or Mask R-CNN** for occlusion — too
+   general-purpose and too slow for broadcast latency.
+
+3. **No vendor explicitly handles motion blur as a separate stage.** The shift
+   from binary masks to alpha mattes makes it a non-problem: a blurred pixel
+   naturally gets alpha ~0.5 from a matting model.
+
+4. **Sport-specific training matters** — Vizrt trains different models per
+   sport (soccer, basketball, etc.).
+
+5. **All details are proprietary.** No vendor publishes architectures or
+   training data. Evidence was triangulated from patent litigation records,
+   researcher profiles, job postings, and product documentation.
+
+Sources: Supponor tech blog, Viz Arena 5.1/6.0 release notes, AIM Sport v
+Supponor UK High Court ruling (EWHC 2023), Kaveena Persand (TGI Sport AI
+researcher) profile, Vizrt hardware requirements docs, BroadTrack WACV 2025.
+
+### Roadmap
+
+#### Step 5A.2 — Soft HSV Distance Keying (immediate improvement, no ML)
+
+**Goal:** Upgrade ColorKeyMasker from binary to continuous alpha output.
+
+**Changes:**
+
+1. Replace `cv2.inRange()` with continuous HSV distance computation:
+   - Compute per-pixel distance from court-color center in HSV space
+   - Map through inner/outer radius soft falloff (like chroma-key softness)
+   - Pixels inside inner radius -> 0.0 (court), outside outer radius -> 1.0
+     (occluder), between -> linear interpolation
+   - Handle hue wrap-around (0/180 boundary)
+
+2. Add guided filter matte refinement (`cv2.ximgproc.guidedFilter`):
+   - Use original frame as guide, soft mask as input
+   - Snaps mask edges to actual image edges
+   - Where player edge is sharp -> mask edge is sharp
+   - Where player edge is blurred -> mask edge is proportionally soft
+
+3. CLI args: `--court_key_softness` (falloff width), `--guided_filter_radius`,
+   `--guided_filter_eps`
+
+**Expected:** Eliminates 80-90% of motion blur fringe. Sub-10ms total. Pure
+OpenCV, no GPU.
+
+**Files:** `color_key_masker.py`, `run_video.py`
+
+#### Step 5A.3 — Production Matting Model (ESPN-grade quality)
+
+**Goal:** Add a learned matting model as the primary production masker. This is
+what deployed broadcast systems actually use.
+
+**Candidate models (to evaluate):**
+
+| Model | Architecture | Speed (1080p) | Alpha quality | Notes |
+|-------|-------------|---------------|---------------|-------|
+| MODNet | Trimap-free, lightweight CNN | 67fps on 1080Ti | Good | Designed for real-time, no trimap needed |
+| RVM (Robust Video Matting) | Recurrent, temporal | 76fps 4K, 104fps HD | Excellent | Has temporal consistency built in |
+| BGMv2 | ResNet backbone + refinement | ~30fps 1080p | Excellent | Higher quality, borderline real-time |
+
+**Key design decisions:**
+
+- Trimap-free is required (no user interaction in live broadcast)
+- Must produce float32 alpha matte, not binary mask
+- Temporal consistency preferred (RVM has this built in)
+- Sport-specific fine-tuning likely needed for best results
+- Must fit within the existing `OcclusionMasker` ABC interface
+
+**Implementation plan:**
+
+1. Research phase: benchmark MODNet, RVM, BGMv2 on our test clips
+   - Measure: inference time, alpha quality on motion-blurred frames,
+     temporal consistency, memory usage
+   - Test with and without sport-specific fine-tuning
+
+2. Integration: new `MattingMasker(OcclusionMasker)` class
+   - `--masker matting` CLI option
+   - Lazy import (torch dependency)
+   - `reset_on_cut()` resets temporal state for RVM
+   - Output: proper float32 alpha matte via `OcclusionMaskerResult`
+
+3. Fine-tuning (if needed): create tennis-specific training data
+   - Use existing maskers to generate pseudo ground-truth
+   - Augment with synthetic motion blur
+   - Fine-tune on tennis broadcast frames
+
+**Files:** new `matting_masker.py`, `run_video.py`, possibly `weights/` for
+model checkpoints.
+
+### Masker comparison (expected after full roadmap)
+
+| Masker | Type | Speed | Blur handling | Quality | Use case |
+|--------|------|-------|---------------|---------|----------|
+| `none` | - | 0ms | - | - | Debug / no occlusion |
+| `person` | Mask R-CNN | ~80ms | Poor | Binary mask | Legacy / reference |
+| `sam2` | SAM2 + YOLO | ~120ms | Poor | Binary mask | Research / highest detail |
+| `yolo_seg` | YOLO11-seg | ~15ms | Poor | Binary mask | Fast ML option |
+| `color_key` | HSV keying | <1ms | Poor (binary) | Binary mask | Zero-dep fallback |
+| `color_key` (5A.2) | Soft HSV + guided filter | ~8ms | Good (soft alpha) | Soft alpha | No-GPU production |
+| `matting` (5A.3) | Learned matting (MODNet/RVM) | ~15ms | Excellent (native alpha) | Production alpha | **ESPN-grade production** |

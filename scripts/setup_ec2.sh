@@ -105,7 +105,8 @@ sudo apt install -y \
     libgl1 \
     libsm6 \
     libxrender1 \
-    libglib2.0-0
+    libglib2.0-0 \
+    unzip
 
 echo "  System packages installed"
 

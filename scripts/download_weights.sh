@@ -28,7 +28,7 @@ set -euo pipefail
 # Source: https://drive.google.com/file/d/1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG
 GDRIVE_FILE_ID="1f-Co64ehgq4uddcQm1aFBDtbnyZhQvgG"
 OUTPUT_PATH="weights/tennis_court_detector.pt"
-MIN_SIZE_BYTES=100000000  # ~100 MB minimum (actual file is ~178 MB)
+MIN_SIZE_BYTES=40000000  # ~40 MB minimum (actual file is ~42 MB)
 
 # --------------------------------------------------------------------------
 # Helper
@@ -95,6 +95,45 @@ fi
 
 echo ""
 echo "  TennisCourtDetector weights: $OUTPUT_PATH ($(( FILE_SIZE / 1024 / 1024 )) MB)"
+echo ""
+
+# --------------------------------------------------------------------------
+# Download SAM2 weights (optional — only if --sam2 flag is passed)
+# --------------------------------------------------------------------------
+SAM2_CHECKPOINT_PATH="weights/sam2.1_hiera_small.pt"
+SAM2_URL="https://dl.fbaipublicfiles.com/segment_anything_2/092824/sam2.1_hiera_small.pt"
+SAM2_MIN_SIZE_BYTES=40000000  # ~40 MB minimum (actual ~46 MB)
+
+if [[ "${1:-}" == "--sam2" ]] || [[ "${SAM2_DOWNLOAD:-}" == "1" ]]; then
+    info "Downloading SAM2 weights"
+    if [ -f "$SAM2_CHECKPOINT_PATH" ]; then
+        SAM2_SIZE=$(stat --printf="%s" "$SAM2_CHECKPOINT_PATH" 2>/dev/null || stat -f%z "$SAM2_CHECKPOINT_PATH" 2>/dev/null || echo "0")
+        if [ "$SAM2_SIZE" -gt "$SAM2_MIN_SIZE_BYTES" ]; then
+            echo "  SAM2 weights already exist: $SAM2_CHECKPOINT_PATH ($(( SAM2_SIZE / 1024 / 1024 )) MB)"
+            echo "  Skipping download."
+        else
+            echo "  File exists but looks too small — re-downloading..."
+            rm -f "$SAM2_CHECKPOINT_PATH"
+            curl -L -o "$SAM2_CHECKPOINT_PATH" "$SAM2_URL"
+        fi
+    else
+        echo "  Downloading SAM2.1 Hiera Small checkpoint..."
+        echo "  URL:    $SAM2_URL"
+        echo "  Output: $SAM2_CHECKPOINT_PATH"
+        curl -L -o "$SAM2_CHECKPOINT_PATH" "$SAM2_URL"
+    fi
+
+    if [ -f "$SAM2_CHECKPOINT_PATH" ]; then
+        SAM2_SIZE=$(stat --printf="%s" "$SAM2_CHECKPOINT_PATH" 2>/dev/null || stat -f%z "$SAM2_CHECKPOINT_PATH" 2>/dev/null || echo "0")
+        echo "  SAM2 weights: $SAM2_CHECKPOINT_PATH ($(( SAM2_SIZE / 1024 / 1024 )) MB)"
+    else
+        echo "  WARNING: SAM2 download failed. Download manually from:"
+        echo "    $SAM2_URL"
+    fi
+else
+    echo "  SAM2 weights: skipped (pass --sam2 to download)"
+fi
+
 echo ""
 echo "  Note: Mask R-CNN weights (for --masker person) will be"
 echo "  auto-downloaded by torchvision on first run (~170 MB)."

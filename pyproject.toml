@@ -7,6 +7,7 @@ requires-python = ">=3.10"
 dependencies = [
     "opencv-python>=4.8.0",
     "PyYAML>=6.0",
+    "scipy>=1.10",
 ]
 
 [project.optional-dependencies]
@@ -17,6 +18,37 @@ calibration = [
 occlusion = [
     "torch>=2.0",
     "torchvision>=0.17",
+]
+sam2 = [
+    "torch>=2.0",
+    "torchvision>=0.17",
+    "sam2>=1.0",
+    "huggingface-hub>=0.20",
+]
+yolo = [
+    "ultralytics>=8.0",
+]
+matting = [
+    "torch>=2.0",
+    "torchvision>=0.17",
+]
+matanyone = [
+    "torch>=2.0",
+    "torchvision>=0.17",
+    "imageio>=2.30",
+    "huggingface-hub>=0.20",
+    "safetensors>=0.4",
+    "chardet>=5.0",
+    # The matanyone package itself must be installed separately:
+    #   uv pip install --no-deps git+https://github.com/pq-yang/MatAnyone.git
+    # (its transitive dep cchardet fails to build on Python 3.12)
+]
+depth = [
+    "torch>=2.0",
+    "transformers>=4.40",
+]
+guided_filter = [
+    "opencv-contrib-python>=4.8.0",
 ]
 dev = [
     "pytest>=8.0",
