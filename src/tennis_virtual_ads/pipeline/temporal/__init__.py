@@ -5,6 +5,9 @@ from tennis_virtual_ads.pipeline.temporal.homography_stabilizer import Homograph
 from tennis_virtual_ads.pipeline.temporal.jitter_tracker import JitterTracker
 from tennis_virtual_ads.pipeline.temporal.keypoint_smoother import KeypointSmoother
 from tennis_virtual_ads.pipeline.temporal.keypoint_tracker import KeypointTracker
+from tennis_virtual_ads.pipeline.temporal.lookahead_smoother import LookaheadSmoother
+from tennis_virtual_ads.pipeline.temporal.stability_metrics import StabilityCollector
+from tennis_virtual_ads.pipeline.temporal.two_pass_smoother import TwoPassSmoother
 
 __all__ = [
     "CutDetector",
@@ -12,4 +15,7 @@ __all__ = [
     "JitterTracker",
     "KeypointSmoother",
     "KeypointTracker",
+    "LookaheadSmoother",
+    "StabilityCollector",
+    "TwoPassSmoother",
 ]

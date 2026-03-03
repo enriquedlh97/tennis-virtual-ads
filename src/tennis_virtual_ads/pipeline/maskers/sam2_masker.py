@@ -62,13 +62,25 @@ def _yolo_available() -> bool:
         return False
 
 
+_SAM2_MODEL_CONFIGS: dict[str, str] = {
+    "sam2.1_hiera_tiny": "configs/sam2.1/sam2.1_hiera_t.yaml",
+    "sam2.1_hiera_small": "configs/sam2.1/sam2.1_hiera_s.yaml",
+    "sam2.1_hiera_base_plus": "configs/sam2.1/sam2.1_hiera_b+.yaml",
+    "sam2.1_hiera_large": "configs/sam2.1/sam2.1_hiera_l.yaml",
+}
+"""Map model names to their config YAML paths (within the sam2 package)."""
+
+
 class SAM2Masker(OcclusionMasker):
     """SAM2-based occlusion masker with auto-prompting.
 
     Parameters
     ----------
     model_name : str
-        SAM2 model checkpoint name.  Default ``"sam2.1_hiera_small"``.
+        SAM2 model name.  Default ``"sam2.1_hiera_small"``.
+    checkpoint_path : str | None
+        Path to SAM2 checkpoint file.  If ``None``, defaults to
+        ``"weights/sam2.1_hiera_small.pt"``.
     device : str | None
         PyTorch device string.  Auto-selects CUDA if available.
     confidence_threshold : float
@@ -88,6 +100,7 @@ class SAM2Masker(OcclusionMasker):
     def __init__(
         self,
         model_name: str = "sam2.1_hiera_small",
+        checkpoint_path: str | None = None,
         device: str | None = None,
         confidence_threshold: float = 0.5,
         reprompt_interval: int = 100,
@@ -109,18 +122,38 @@ class SAM2Masker(OcclusionMasker):
         else:
             self._device = torch.device(device)
 
+        # Resolve config and checkpoint.
+        config_file = _SAM2_MODEL_CONFIGS.get(model_name)
+        if config_file is None:
+            raise ValueError(
+                f"Unknown SAM2 model '{model_name}'. Available: {list(_SAM2_MODEL_CONFIGS.keys())}"
+            )
+        if checkpoint_path is None:
+            checkpoint_path = f"weights/{model_name}.pt"
+
         # --- Load SAM2 ---
-        logger.info("Loading SAM2 model '%s' on %s ...", model_name, self._device)
+        logger.info(
+            "Loading SAM2 model '%s' (config=%s, ckpt=%s) on %s ...",
+            model_name,
+            config_file,
+            checkpoint_path,
+            self._device,
+        )
         load_start = time.perf_counter()
 
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        # Use image predictor mode (frame-by-frame with manual propagation).
         self._sam2_model = build_sam2(
-            model_name,
+            config_file,
+            checkpoint_path,
             device=str(self._device),
         )
+
+        # FP16 inference on CUDA for memory savings (fits T4 16GB).
+        if self._device.type == "cuda":
+            self._sam2_model.half()
+
         self._sam2_predictor = SAM2ImagePredictor(self._sam2_model)
 
         load_elapsed = time.perf_counter() - load_start
@@ -286,7 +319,7 @@ class SAM2Masker(OcclusionMasker):
         tensor = self._mrcnn_transforms(tensor)
         tensor = tensor.to(self._device)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             predictions = self._mrcnn_model([tensor])[0]
 
         labels = predictions["labels"].cpu().numpy()
@@ -358,6 +391,7 @@ class SAM2Masker(OcclusionMasker):
         as a prompt (mask prompting).  This provides temporal consistency
         without the full video predictor overhead.
         """
+        import cv2 as _cv2
         import torch
 
         frame_height, frame_width = frame.shape[:2]
@@ -368,10 +402,16 @@ class SAM2Masker(OcclusionMasker):
         rgb = frame[:, :, ::-1].copy()
         self._sam2_predictor.set_image(rgb)
 
-        # Use previous mask as prompt.
+        # SAM2 expects mask_input as (1, 256, 256) logits — resize the
+        # previous binary mask and convert to logit-like values.
+        mask_resized = _cv2.resize(self._prev_mask, (256, 256), interpolation=_cv2.INTER_LINEAR)
+        # Convert [0,1] binary mask to logit-scale: positive = foreground.
+        mask_logits = (mask_resized * 20.0 - 10.0).astype(np.float32)
+        mask_input = mask_logits[np.newaxis, :, :]  # (1, 256, 256)
+
         with torch.inference_mode():
             masks, scores, _ = self._sam2_predictor.predict(
-                mask_input=self._prev_mask[np.newaxis, :, :].astype(np.float32),
+                mask_input=mask_input,
                 multimask_output=False,
             )
 

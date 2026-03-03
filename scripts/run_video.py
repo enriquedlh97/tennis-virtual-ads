@@ -476,6 +476,7 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
 
         return SAM2Masker(
             confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            checkpoint_path=kwargs.get("checkpoint_path"),
             device=kwargs.get("device"),
             reprompt_interval=kwargs.get("reprompt_interval", 100),
             use_yolo=kwargs.get("use_yolo", True),
@@ -824,6 +825,52 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Disable jitter tracking (default: enabled when calibration is active).",
     )
 
+    # --- Lookahead smoother -----------------------------------------------
+    parser.add_argument(
+        "--lookahead",
+        type=int,
+        default=0,
+        help=(
+            "Enable non-causal lookahead smoothing with N-frame buffer "
+            "(e.g. 10 = ~333ms delay at 30fps).  Replaces --stabilize_h "
+            "when active.  0 = disabled (default)."
+        ),
+    )
+    parser.add_argument(
+        "--savgol_polyorder",
+        type=int,
+        default=3,
+        help="Savitzky-Golay polynomial order for lookahead/two-pass smoothing (default: 3).",
+    )
+
+    # --- Two-pass smoother ------------------------------------------------
+    parser.add_argument(
+        "--two_pass",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable full two-pass smoothing (maximum quality, 2x processing "
+            "time).  Pass 1 collects all homographies, pass 2 renders with "
+            "globally smoothed H."
+        ),
+    )
+
+    # --- SAM2 checkpoint --------------------------------------------------
+    parser.add_argument(
+        "--sam2_checkpoint",
+        type=str,
+        default=None,
+        help="Path to SAM2 checkpoint file (default: weights/sam2.1_hiera_small.pt).",
+    )
+
+    # --- Stability metrics ------------------------------------------------
+    parser.add_argument(
+        "--stability_json",
+        type=str,
+        default=None,
+        help="Path to write stability report JSON file (default: disabled).",
+    )
+
     # --- Config -----------------------------------------------------------
     parser.add_argument(
         "--config",
@@ -1043,6 +1090,76 @@ def main() -> None:
             args.cut_cooldown_frames,
         )
 
+    # --- Lookahead smoother (optional) ------------------------------------
+    lookahead_n: int = args.lookahead
+    lookahead_enabled: bool = lookahead_n > 0 and calibrator is not None
+    lookahead_smoother = None
+
+    if lookahead_enabled:
+        from tennis_virtual_ads.pipeline.temporal.lookahead_smoother import LookaheadSmoother
+
+        # Lookahead replaces --stabilize_h (strictly better with lookahead).
+        if stabilize_h_enabled:
+            logger.info(
+                "Lookahead mode active -- disabling --stabilize_h "
+                "(lookahead smoothing replaces causal H-filtering)."
+            )
+            homography_stabilizer = None
+            stabilize_h_enabled = False
+
+        lookahead_smoother = LookaheadSmoother(
+            lookahead=lookahead_n,
+            polyorder=args.savgol_polyorder,
+        )
+        logger.info(
+            "Lookahead smoother enabled: lookahead=%d  polyorder=%d  window=%d  delay=%.0fms@30fps",
+            lookahead_n,
+            args.savgol_polyorder,
+            2 * lookahead_n + 1,
+            lookahead_n / 30.0 * 1000.0,
+        )
+
+    # --- Two-pass smoother (optional) -------------------------------------
+    two_pass_enabled: bool = args.two_pass and calibrator is not None
+    two_pass_smoother = None
+
+    if two_pass_enabled:
+        from tennis_virtual_ads.pipeline.temporal.two_pass_smoother import TwoPassSmoother
+
+        # Two-pass replaces both --stabilize_h and --lookahead.
+        if stabilize_h_enabled:
+            logger.info("Two-pass mode active -- disabling --stabilize_h.")
+            homography_stabilizer = None
+            stabilize_h_enabled = False
+        if lookahead_enabled:
+            logger.info("Two-pass mode active -- disabling --lookahead.")
+            lookahead_smoother = None
+            lookahead_enabled = False
+
+        two_pass_smoother = TwoPassSmoother(
+            window_length=2 * max(args.lookahead, 15) + 1,  # Default window=31
+            polyorder=args.savgol_polyorder,
+        )
+        logger.info(
+            "Two-pass smoother enabled: window=%d  polyorder=%d",
+            two_pass_smoother._window_length,
+            args.savgol_polyorder,
+        )
+
+    # --- Stability collector (optional) -----------------------------------
+    stability_collector = None
+
+    if calibrator is not None:
+        from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
+            refer_kps as _stab_metric_refer_kps,
+        )
+        from tennis_virtual_ads.pipeline.temporal.stability_metrics import StabilityCollector
+
+        stability_collector = StabilityCollector(
+            reference_points=_stab_metric_refer_kps.copy(),
+        )
+        logger.info("Stability metrics collection enabled")
+
     # --- Ad placement (optional) ------------------------------------------
     ad_config: dict[str, Any] = config.get("ad", {})
     ad_enabled: bool = args.ad_enable or ad_config.get("enabled", False)
@@ -1102,6 +1219,8 @@ def main() -> None:
         if masker_name == "sam2":
             masker_kwargs["reprompt_interval"] = args.sam2_reprompt_interval
             masker_kwargs["use_yolo"] = not args.sam2_no_yolo
+            if args.sam2_checkpoint is not None:
+                masker_kwargs["checkpoint_path"] = args.sam2_checkpoint
         masker = create_masker(
             masker_name,
             **masker_kwargs,
@@ -1165,8 +1284,8 @@ def main() -> None:
     logger.info(
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
-        "track_kps=%s  stabilize_h=%s  h_filter=%s  cut_detect=%s  "
-        "jitter_track=%s  ad=%s  masker=%s  blend=%s",
+        "track_kps=%s  stabilize_h=%s  h_filter=%s  lookahead=%s  two_pass=%s  "
+        "cut_detect=%s  jitter_track=%s  ad=%s  masker=%s  blend=%s",
         start_frame,
         max_frames,
         stride,
@@ -1178,6 +1297,8 @@ def main() -> None:
         track_keypoints_enabled,
         stabilize_h_enabled,
         args.h_filter,
+        lookahead_n if lookahead_enabled else "off",
+        two_pass_enabled,
         cut_detection_enabled,
         jitter_tracker_enabled,
         ad_enabled,
@@ -1186,11 +1307,40 @@ def main() -> None:
     )
 
     # --- Process video ----------------------------------------------------
+    from collections import deque as _deque
+
     wall_clock_start = time.perf_counter()
     accepted_count = 0
     rejected_count = 0
     reset_count = 0
     cut_count = 0
+
+    # Per-frame state carried through lookahead / two-pass buffering.
+    class _FrameState:
+        __slots__ = (
+            "calibration_result",
+            "did_reset",
+            "homography_for_drawing",
+            "is_accepted",
+            "is_cut",
+            "raw_keypoints",
+            "reproj_error",
+            "smoothed_error",
+            "stabilizer_did_reject",
+            "stabilizer_is_holding",
+        )
+
+        def __init__(self) -> None:
+            self.calibration_result: CalibrationResult | None = None
+            self.homography_for_drawing: np.ndarray | None = None
+            self.is_accepted: bool = False
+            self.stabilizer_is_holding: bool = False
+            self.stabilizer_did_reject: bool = False
+            self.raw_keypoints: np.ndarray | None = None
+            self.smoothed_error: float | None = None
+            self.did_reset: bool = False
+            self.is_cut: bool = False
+            self.reproj_error: float | None = None
 
     with VideoReader(
         args.input,
@@ -1208,298 +1358,430 @@ def main() -> None:
             width=output_width,
             height=output_height,
         ) as writer:
-            for frame_index, frame in reader:
-                # --- HUD: frame index ------------------------------------
-                overlay_frame_index(frame, frame_index)
+            # ==============================================================
+            # Render helper (closure over outer-scope variables)
+            # ==============================================================
+            def _render_frame(
+                frame: np.ndarray,
+                final_H: np.ndarray | None,
+                state: _FrameState,
+            ) -> None:
+                """Render overlays, ads, HUD onto *frame* and write it."""
+                has_usable_homography = final_H is not None
 
-                # --- Calibration -----------------------------------------
-                if calibrator is not None:
-                    # Use keypoint tracker (LK optical flow) when enabled,
-                    # otherwise fall back to direct calibrator detection.
-                    if keypoint_tracker is not None:
-                        calibration_result = keypoint_tracker.update(frame)
-                    else:
-                        calibration_result = calibrator.estimate(frame)
-                    raw_homography = calibration_result["H"]
-                    confidence = calibration_result["conf"]
-                    raw_keypoints = calibration_result["keypoints"]
-                    raw_error = calibration_result["debug"].get("reprojection_error_px")
-
-                    is_accepted = raw_homography is not None and confidence >= calib_conf_threshold
-
-                    # --- Scene-cut detection (before temporal processing) --
-                    is_cut = False
-                    if cut_detector is not None:
-                        is_cut = cut_detector.update(frame, raw_homography, confidence, raw_error)
-                        if is_cut:
-                            cut_count += 1
-                            logger.info(
-                                "Cut detected at frame %d  (frame_diff=%.1f  proj_jump=%s)",
-                                frame_index,
-                                cut_detector.last_frame_diff or 0.0,
-                                (
-                                    f"{cut_detector.last_projection_jump:.1f}"
-                                    if cut_detector.last_projection_jump is not None
-                                    else "N/A"
-                                ),
-                            )
-                            # Reset all temporal state.
-                            if keypoint_tracker is not None:
-                                keypoint_tracker.reset()
-                            if smoother is not None:
-                                smoother.reset()
-                            if homography_stabilizer is not None:
-                                homography_stabilizer.reset()
-                            if raw_jitter_tracker is not None:
-                                raw_jitter_tracker.reset()
-                            if tracked_jitter_tracker is not None:
-                                tracked_jitter_tracker.reset()
-                            if smoothed_jitter_tracker is not None:
-                                smoothed_jitter_tracker.reset()
-                            if stabilized_jitter_tracker is not None:
-                                stabilized_jitter_tracker.reset()
-                            # Also reset SAM2 masker on scene cut.
-                            if masker is not None and hasattr(masker, "reset_on_cut"):
-                                masker.reset_on_cut()
-
-                    # --- Jitter tracking: raw H --------------------------
-                    if (
-                        raw_jitter_tracker is not None
-                        and is_accepted
-                        and raw_homography is not None
-                    ):
-                        raw_jitter_tracker.update(raw_homography)
-
-                    # --- Jitter tracking: tracked H ----------------------
-                    # When keypoint tracking is active, the raw_homography
-                    # IS the tracked output.  Feed it to the tracked tracker.
-                    if (
-                        tracked_jitter_tracker is not None
-                        and keypoint_tracker is not None
-                        and is_accepted
-                        and raw_homography is not None
-                    ):
-                        tracked_jitter_tracker.update(raw_homography)
-
-                    # --- Smoothing (optional) ----------------------------
-                    homography_for_drawing = raw_homography
-                    smoothed_error: float | None = None
-                    did_reset = False
-
-                    if (
-                        smoother is not None
-                        and is_accepted
-                        and raw_keypoints is not None
-                        and recompute_homography is not None
-                        and compute_reproj_error is not None
-                    ):
-                        smoothed_kps = smoother.update(raw_keypoints, raw_error)
-                        did_reset = smoother.did_reset_this_frame
-
-                        if did_reset:
-                            reset_count += 1
-
-                        # Recompute H from smoothed keypoints.
-                        smoothed_tuples = keypoints_array_to_tuple_list(smoothed_kps)
-                        smoothed_h = recompute_homography(smoothed_tuples)
-
-                        if smoothed_h is not None:
-                            homography_for_drawing = smoothed_h
-                            smoothed_error = compute_reproj_error(smoothed_tuples, smoothed_h)
-
-                            # --- Jitter tracking: smoothed H -------------
-                            if smoothed_jitter_tracker is not None:
-                                smoothed_jitter_tracker.update(smoothed_h)
-
-                    if is_accepted:
-                        accepted_count += 1
-                    else:
-                        rejected_count += 1
-
-                    # --- Homography stabilization (optional) --------------
-                    # Called on EVERY frame (even rejected ones) so the
-                    # hold-last-good counter advances correctly.
-                    stabilizer_is_holding = False
-                    stabilizer_did_reject = False
-
-                    if homography_stabilizer is not None:
-                        # Determine which error to pass: smoothed if
-                        # keypoint smoothing is active, else raw.
-                        stabilizer_input_error = (
-                            smoothed_error if smoother is not None else raw_error
-                        )
-
-                        if is_accepted and homography_for_drawing is not None:
-                            H_stable = homography_stabilizer.update(
-                                homography_for_drawing,
-                                confidence,
-                                stabilizer_input_error,
-                            )
-                        else:
-                            # Calibration failed/rejected: trigger hold.
-                            H_stable = homography_stabilizer.update(None, 0.0, None)
-
-                        stabilizer_is_holding = homography_stabilizer.is_holding
-                        stabilizer_did_reject = homography_stabilizer.did_reject_this_frame
-
-                        if H_stable is not None:
-                            homography_for_drawing = H_stable
-
-                            # Jitter tracking: stabilized H.
-                            if stabilized_jitter_tracker is not None:
-                                stabilized_jitter_tracker.update(H_stable)
-
-                    # --- Determine if we have a usable H ------------------
-                    # When the stabilizer is active, it may provide a held
-                    # H even when this frame's calibration was rejected.
-                    has_usable_homography = homography_for_drawing is not None and (
-                        is_accepted or stabilizer_is_holding
+                # Stability metrics.
+                if stability_collector is not None:
+                    stability_collector.update(
+                        final_H,
+                        reproj_error=state.reproj_error,
+                        is_accepted=state.is_accepted,
+                        is_held=state.stabilizer_is_holding,
+                        is_cut=state.is_cut,
                     )
+                    if state.is_cut:
+                        stability_collector.reset_temporal()
 
-                    # --- HUD: calibration status -------------------------
-                    overlay_calibration_status(frame, calibration_result, is_accepted)
+                # Deferred masker reset for lookahead / two-pass modes.
+                if state.is_cut and masker is not None and hasattr(masker, "reset_on_cut"):
+                    masker.reset_on_cut()
 
-                    # --- HUD: smoothing status (line 3) ------------------
-                    if smoother is not None:
-                        overlay_smoothing_status(frame, smoothed_error, did_reset)
+                # HUD: calibration status.
+                if state.calibration_result is not None:
+                    overlay_calibration_status(frame, state.calibration_result, state.is_accepted)
 
-                    # --- Drawing -----------------------------------------
-                    if (
-                        draw_mode == "overlay"
-                        and has_usable_homography
-                        and homography_for_drawing is not None
-                        and calibrator_court_lines is not None
-                    ):
-                        draw_projected_lines(frame, homography_for_drawing, calibrator_court_lines)
+                # HUD: smoothing status.
+                if smoother is not None:
+                    overlay_smoothing_status(frame, state.smoothed_error, state.did_reset)
 
-                    if draw_mode == "keypoints" and raw_keypoints is not None:
-                        draw_keypoints(frame, raw_keypoints, show_index=False)
+                # Drawing.
+                if (
+                    draw_mode == "overlay"
+                    and has_usable_homography
+                    and final_H is not None
+                    and calibrator_court_lines is not None
+                ):
+                    draw_projected_lines(frame, final_H, calibrator_court_lines)
+                if draw_mode == "keypoints" and state.raw_keypoints is not None:
+                    draw_keypoints(frame, state.raw_keypoints, show_index=False)
 
-                    # --- Occlusion masking --------------------------------
-                    occlusion_mask: np.ndarray | None = None
-                    mask_instance_count: int = 0
+                # Occlusion masking.
+                occlusion_mask: np.ndarray | None = None
+                mask_instance_count: int = 0
 
-                    if masker is not None:
-                        masker_result = masker.mask(frame)
-                        occlusion_mask = masker_result["mask"]
-                        mask_instance_count = masker_result["debug"].get("instance_count", 0)
-
-                        # Dilate the mask slightly to cover rackets and
-                        # limbs near the body edge that the model may miss.
-                        if mask_dilate_px > 0 and np.any(occlusion_mask > 0):
-                            dilate_kernel = cv2.getStructuringElement(
-                                cv2.MORPH_ELLIPSE,
-                                (2 * mask_dilate_px + 1, 2 * mask_dilate_px + 1),
-                            )
-                            occlusion_mask = cv2.dilate(occlusion_mask, dilate_kernel, iterations=1)
-
-                    # --- Ad placement ------------------------------------
-                    blend_debug_payload: dict[str, Any] = {}
-
-                    if (
-                        ad_placer is not None
-                        and ad_rgba is not None
-                        and prepared_ad_placement is not None
-                        and has_usable_homography
-                        and homography_for_drawing is not None
-                    ):
-                        warped_rgba, warped_mask = ad_placer.warp(
-                            ad_rgba,
-                            homography_for_drawing,
-                            prepared_ad_placement,
-                            frame.shape,
+                if masker is not None:
+                    masker_result = masker.mask(frame)
+                    occlusion_mask = masker_result["mask"]
+                    mask_instance_count = masker_result["debug"].get("instance_count", 0)
+                    if mask_dilate_px > 0 and np.any(occlusion_mask > 0):
+                        dilate_kernel = cv2.getStructuringElement(
+                            cv2.MORPH_ELLIPSE,
+                            (2 * mask_dilate_px + 1, 2 * mask_dilate_px + 1),
                         )
+                        occlusion_mask = cv2.dilate(occlusion_mask, dilate_kernel, iterations=1)
 
-                        # When an occlusion mask is active, punch through
-                        # the ad alpha so that players remain visible.
-                        if occlusion_mask is not None:
-                            effective_alpha = warped_mask * (1.0 - occlusion_mask)
-                        else:
-                            effective_alpha = warped_mask
+                # Ad placement + compositing.
+                blend_debug_payload: dict[str, Any] = {}
 
-                        # --- Compositing (naive or painted) ---------------
-                        if blend_mode == "painted_v1":
-                            assert _painted_composite is not None
-                            # Compute court mask from 4 outer corners.
-                            court_mask = _compute_court_mask(homography_for_drawing, frame.shape)
-                            blend_debug_payload = _painted_composite(
-                                frame,
-                                warped_rgba,
-                                effective_alpha,
-                                court_mask,
-                                shade_blur_ksize=args.shade_blur_ksize,
-                                shade_strength=args.shade_strength,
-                                alpha_feather_px=args.alpha_feather_px,
-                            )
-                        else:
-                            ad_placer.composite(frame, warped_rgba, effective_alpha)
+                if (
+                    ad_placer is not None
+                    and ad_rgba is not None
+                    and prepared_ad_placement is not None
+                    and has_usable_homography
+                    and final_H is not None
+                ):
+                    warped_rgba, warped_mask = ad_placer.warp(
+                        ad_rgba,
+                        final_H,
+                        prepared_ad_placement,
+                        frame.shape,
+                    )
+                    if occlusion_mask is not None:
+                        effective_alpha = warped_mask * (1.0 - occlusion_mask)
+                    else:
+                        effective_alpha = warped_mask
 
-                    # --- HUD: ad / stabilizer / mask / blend status -------
-                    # Count how many HUD lines are already used so each
-                    # status line lands on the correct row.
-                    next_hud_line = 2
-                    if smoother is not None:
-                        next_hud_line = 3
-
-                    if homography_stabilizer is not None:
-                        overlay_stabilizer_status(
+                    if blend_mode == "painted_v1":
+                        assert _painted_composite is not None
+                        court_mask = _compute_court_mask(final_H, frame.shape)
+                        blend_debug_payload = _painted_composite(
                             frame,
-                            h_alpha,
-                            stabilizer_is_holding,
-                            homography_stabilizer.hold_count,
-                            args.hold_frames,
-                            stabilizer_did_reject,
-                            next_hud_line,
+                            warped_rgba,
+                            effective_alpha,
+                            court_mask,
+                            shade_blur_ksize=args.shade_blur_ksize,
+                            shade_strength=args.shade_strength,
+                            alpha_feather_px=args.alpha_feather_px,
                         )
-                        next_hud_line += 1
+                    else:
+                        ad_placer.composite(frame, warped_rgba, effective_alpha)
 
-                    if ad_placer is not None:
-                        overlay_ad_status(frame, ad_anchor_name, smooth_enabled, next_hud_line)
-                        next_hud_line += 1
+                # HUD status lines.
+                next_hud_line = 2
+                if smoother is not None:
+                    next_hud_line = 3
 
-                    # --- HUD: mask status --------------------------------
-                    if masker is not None:
-                        overlay_mask_status(frame, masker_name, mask_instance_count, next_hud_line)
-                        next_hud_line += 1
+                if homography_stabilizer is not None:
+                    overlay_stabilizer_status(
+                        frame,
+                        h_alpha,
+                        state.stabilizer_is_holding,
+                        homography_stabilizer.hold_count,
+                        args.hold_frames,
+                        state.stabilizer_did_reject,
+                        next_hud_line,
+                    )
+                    next_hud_line += 1
 
-                    # --- HUD: blend status --------------------------------
-                    if blend_mode != "naive" and ad_placer is not None:
-                        overlay_blend_status(
-                            frame,
-                            blend_mode,
-                            args.shade_blur_ksize,
-                            args.shade_strength,
-                            args.alpha_feather_px,
-                            next_hud_line,
-                        )
-                        next_hud_line += 1
+                if ad_placer is not None:
+                    overlay_ad_status(frame, ad_anchor_name, smooth_enabled, next_hud_line)
+                    next_hud_line += 1
+                if masker is not None:
+                    overlay_mask_status(frame, masker_name, mask_instance_count, next_hud_line)
+                    next_hud_line += 1
+                if blend_mode != "naive" and ad_placer is not None:
+                    overlay_blend_status(
+                        frame,
+                        blend_mode,
+                        args.shade_blur_ksize,
+                        args.shade_strength,
+                        args.alpha_feather_px,
+                        next_hud_line,
+                    )
+                    next_hud_line += 1
+                if state.is_cut:
+                    overlay_cut_detected(frame, next_hud_line)
 
-                    # --- HUD: cut detected --------------------------------
-                    if is_cut:
-                        overlay_cut_detected(frame, next_hud_line)
-
-                    # --- Debug: mask overlay (bottom-right) ---------------
-                    if mask_debug and occlusion_mask is not None:
-                        overlay_mask_debug(frame, occlusion_mask)
-
-                    # --- Debug: shade overlay (bottom-left) ---------------
-                    if blend_debug and blend_debug_payload and "shade_map" in blend_debug_payload:
-                        overlay_shade_debug(frame, blend_debug_payload["shade_map"])
+                # Debug overlays.
+                if mask_debug and occlusion_mask is not None:
+                    overlay_mask_debug(frame, occlusion_mask)
+                if blend_debug and blend_debug_payload and "shade_map" in blend_debug_payload:
+                    overlay_shade_debug(frame, blend_debug_payload["shade_map"])
 
                 writer.write(frame)
 
-                if writer.frames_written % 100 == 0:
-                    elapsed = time.perf_counter() - wall_clock_start
-                    logger.info(
-                        "Progress: %d frames written  (%.1f s elapsed, ~%.1f fps)  "
-                        "calib_ok=%d  calib_fail=%d  resets=%d",
-                        writer.frames_written,
-                        elapsed,
-                        writer.frames_written / max(elapsed, 1e-6),
-                        accepted_count,
-                        rejected_count,
-                        reset_count,
+            # ==============================================================
+            # Per-frame H computation (calibration → tracking → smoothing
+            # → stabilization).  Returns a _FrameState.
+            # ==============================================================
+            def _compute_frame_state(
+                frame: np.ndarray,
+                frame_index: int,
+            ) -> _FrameState:
+                nonlocal accepted_count, rejected_count, reset_count, cut_count
+
+                state = _FrameState()
+
+                if calibrator is None:
+                    return state
+
+                # --- Calibration / tracking ---
+                if keypoint_tracker is not None:
+                    calibration_result = keypoint_tracker.update(frame)
+                else:
+                    calibration_result = calibrator.estimate(frame)
+
+                raw_homography = calibration_result["H"]
+                confidence = calibration_result["conf"]
+                raw_keypoints = calibration_result["keypoints"]
+                raw_error = calibration_result["debug"].get("reprojection_error_px")
+                is_accepted = raw_homography is not None and confidence >= calib_conf_threshold
+
+                # --- Scene-cut detection ---
+                is_cut = False
+                if cut_detector is not None:
+                    is_cut = cut_detector.update(
+                        frame,
+                        raw_homography,
+                        confidence,
+                        raw_error,
                     )
+                    if is_cut:
+                        cut_count += 1
+                        logger.info(
+                            "Cut detected at frame %d  (frame_diff=%.1f  proj_jump=%s)",
+                            frame_index,
+                            cut_detector.last_frame_diff or 0.0,
+                            (
+                                f"{cut_detector.last_projection_jump:.1f}"
+                                if cut_detector.last_projection_jump is not None
+                                else "N/A"
+                            ),
+                        )
+                        # Reset H-computation temporal state.
+                        if keypoint_tracker is not None:
+                            keypoint_tracker.reset()
+                        if smoother is not None:
+                            smoother.reset()
+                        if homography_stabilizer is not None:
+                            homography_stabilizer.reset()
+                        if raw_jitter_tracker is not None:
+                            raw_jitter_tracker.reset()
+                        if tracked_jitter_tracker is not None:
+                            tracked_jitter_tracker.reset()
+                        if smoothed_jitter_tracker is not None:
+                            smoothed_jitter_tracker.reset()
+                        if stabilized_jitter_tracker is not None:
+                            stabilized_jitter_tracker.reset()
+                        # Masker reset is deferred to _render_frame so
+                        # that buffered frames render correctly.
+
+                # --- Jitter tracking: raw H ---
+                if raw_jitter_tracker is not None and is_accepted and raw_homography is not None:
+                    raw_jitter_tracker.update(raw_homography)
+
+                # --- Jitter tracking: tracked H ---
+                if (
+                    tracked_jitter_tracker is not None
+                    and keypoint_tracker is not None
+                    and is_accepted
+                    and raw_homography is not None
+                ):
+                    tracked_jitter_tracker.update(raw_homography)
+
+                # --- Keypoint smoothing ---
+                homography_for_drawing = raw_homography
+                smoothed_error: float | None = None
+                did_reset = False
+
+                if (
+                    smoother is not None
+                    and is_accepted
+                    and raw_keypoints is not None
+                    and recompute_homography is not None
+                    and compute_reproj_error is not None
+                ):
+                    smoothed_kps = smoother.update(raw_keypoints, raw_error)
+                    did_reset = smoother.did_reset_this_frame
+                    if did_reset:
+                        reset_count += 1
+                    smoothed_tuples = keypoints_array_to_tuple_list(smoothed_kps)
+                    smoothed_h = recompute_homography(smoothed_tuples)
+                    if smoothed_h is not None:
+                        homography_for_drawing = smoothed_h
+                        smoothed_error = compute_reproj_error(
+                            smoothed_tuples,
+                            smoothed_h,
+                        )
+                        if smoothed_jitter_tracker is not None:
+                            smoothed_jitter_tracker.update(smoothed_h)
+
+                if is_accepted:
+                    accepted_count += 1
+                else:
+                    rejected_count += 1
+
+                # --- H stabilization (only in normal mode) ---
+                stabilizer_is_holding = False
+                stabilizer_did_reject = False
+
+                if homography_stabilizer is not None:
+                    stabilizer_input_error = smoothed_error if smoother is not None else raw_error
+                    if is_accepted and homography_for_drawing is not None:
+                        H_stable = homography_stabilizer.update(
+                            homography_for_drawing,
+                            confidence,
+                            stabilizer_input_error,
+                        )
+                    else:
+                        H_stable = homography_stabilizer.update(None, 0.0, None)
+
+                    stabilizer_is_holding = homography_stabilizer.is_holding
+                    stabilizer_did_reject = homography_stabilizer.did_reject_this_frame
+
+                    if H_stable is not None:
+                        homography_for_drawing = H_stable
+                        if stabilized_jitter_tracker is not None:
+                            stabilized_jitter_tracker.update(H_stable)
+
+                # --- Pack state ---
+                state.calibration_result = calibration_result
+                state.homography_for_drawing = homography_for_drawing
+                state.is_accepted = is_accepted
+                state.stabilizer_is_holding = stabilizer_is_holding
+                state.stabilizer_did_reject = stabilizer_did_reject
+                state.raw_keypoints = raw_keypoints
+                state.smoothed_error = smoothed_error
+                state.did_reset = did_reset
+                state.is_cut = is_cut
+                state.reproj_error = smoothed_error if smoother is not None else raw_error
+                return state
+
+            # ==============================================================
+            # Main processing loop (three modes)
+            # ==============================================================
+
+            if two_pass_enabled:
+                # --- TWO-PASS MODE ----------------------------------------
+                # Pass 1: collect all homographies (no rendering).
+                logger.info("Two-pass mode: starting pass 1 (collecting homographies) ...")
+                all_frame_states: list[_FrameState] = []
+                assert two_pass_smoother is not None
+
+                for frame_index, frame in reader:
+                    overlay_frame_index(frame, frame_index)
+                    state = _compute_frame_state(frame, frame_index)
+                    two_pass_smoother.collect(
+                        state.homography_for_drawing,
+                        state.is_cut,
+                    )
+                    all_frame_states.append(state)
+                    if len(all_frame_states) % 100 == 0:
+                        elapsed = time.perf_counter() - wall_clock_start
+                        logger.info(
+                            "Pass 1: %d frames collected  (%.1f s, ~%.1f fps)",
+                            len(all_frame_states),
+                            elapsed,
+                            len(all_frame_states) / max(elapsed, 1e-6),
+                        )
+
+                # Smooth entire sequence.
+                logger.info(
+                    "Two-pass: smoothing %d frames ...",
+                    len(all_frame_states),
+                )
+                smoothed_H_list = two_pass_smoother.smooth()
+
+                # Pass 2: re-read video and render with smoothed H.
+                logger.info("Two-pass: starting pass 2 (rendering) ...")
+                pass2_start = time.perf_counter()
+
+                with VideoReader(
+                    args.input,
+                    start_frame=start_frame,
+                    max_frames=max_frames,
+                    stride=stride,
+                    resize=resize,
+                ) as reader2:
+                    for i, (frame_index, frame) in enumerate(reader2):
+                        overlay_frame_index(frame, frame_index)
+                        st = all_frame_states[i]
+                        final_H = smoothed_H_list[i] if i < len(smoothed_H_list) else None
+                        # Fall back to pre-smooth H if smoother returned None.
+                        if final_H is None:
+                            final_H = st.homography_for_drawing
+                        _render_frame(frame, final_H, st)
+
+                        if writer.frames_written % 100 == 0:
+                            elapsed = time.perf_counter() - pass2_start
+                            logger.info(
+                                "Pass 2: %d frames written  (%.1f s, ~%.1f fps)",
+                                writer.frames_written,
+                                elapsed,
+                                writer.frames_written / max(elapsed, 1e-6),
+                            )
+
+            elif lookahead_enabled:
+                # --- LOOKAHEAD MODE ---------------------------------------
+                assert lookahead_smoother is not None
+                frame_buffer: _deque[tuple[np.ndarray, _FrameState]] = _deque()
+
+                for frame_index, frame in reader:
+                    overlay_frame_index(frame, frame_index)
+                    state = _compute_frame_state(frame, frame_index)
+
+                    # Push H into smoother (is_cut used for window segmentation).
+                    smoothed_H = lookahead_smoother.push(
+                        state.homography_for_drawing,
+                        state.is_cut,
+                    )
+
+                    # Buffer this frame (copy since reader may reuse buf).
+                    frame_buffer.append((frame.copy(), state))
+
+                    if smoothed_H is not None:
+                        buf_frame, buf_state = frame_buffer.popleft()
+                        _render_frame(buf_frame, smoothed_H, buf_state)
+
+                    total_processed = accepted_count + rejected_count
+                    if total_processed > 0 and total_processed % 100 == 0:
+                        elapsed = time.perf_counter() - wall_clock_start
+                        logger.info(
+                            "Progress: %d processed, %d written  "
+                            "(%.1f s, ~%.1f fps)  ok=%d  fail=%d",
+                            total_processed,
+                            writer.frames_written,
+                            elapsed,
+                            total_processed / max(elapsed, 1e-6),
+                            accepted_count,
+                            rejected_count,
+                        )
+
+                # Flush remaining buffered frames.
+                flush_results = lookahead_smoother.flush()
+                for smoothed_H_flush in flush_results:
+                    buf_frame, buf_state = frame_buffer.popleft()
+                    final_H = (
+                        smoothed_H_flush
+                        if smoothed_H_flush is not None
+                        else buf_state.homography_for_drawing
+                    )
+                    _render_frame(buf_frame, final_H, buf_state)
+
+            else:
+                # --- NORMAL MODE (immediate rendering) --------------------
+                for frame_index, frame in reader:
+                    overlay_frame_index(frame, frame_index)
+                    state = _compute_frame_state(frame, frame_index)
+
+                    final_H = state.homography_for_drawing
+                    # In normal mode, usability requires acceptance or hold.
+                    if not (state.is_accepted or state.stabilizer_is_holding):
+                        final_H = None
+
+                    _render_frame(frame, final_H, state)
+
+                    if writer.frames_written % 100 == 0:
+                        elapsed = time.perf_counter() - wall_clock_start
+                        logger.info(
+                            "Progress: %d frames written  (%.1f s, ~%.1f fps)  "
+                            "calib_ok=%d  calib_fail=%d  resets=%d",
+                            writer.frames_written,
+                            elapsed,
+                            writer.frames_written / max(elapsed, 1e-6),
+                            accepted_count,
+                            rejected_count,
+                            reset_count,
+                        )
 
             total_frames = writer.frames_written
 
@@ -1526,6 +1808,14 @@ def main() -> None:
             reset_count,
             cut_count,
         )
+
+    # --- Stability report -------------------------------------------------
+    if stability_collector is not None:
+        stability_report = stability_collector.report()
+        if stability_report is not None:
+            logger.info("\n%s", stability_report.to_log_string())
+        if args.stability_json:
+            stability_collector.write_json(args.stability_json)
 
     # --- Jitter summary ---------------------------------------------------
     if raw_jitter_tracker is not None:

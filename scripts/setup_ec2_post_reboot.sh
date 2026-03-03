@@ -73,10 +73,10 @@ pass "uv sync complete (venv created at .venv/)"
 # --------------------------------------------------------------------------
 # 4. Download model weights
 # --------------------------------------------------------------------------
-info "4/8  Downloading model weights"
+info "4/8  Downloading model weights (including SAM2)"
 
-bash scripts/download_weights.sh
-pass "Model weights ready"
+bash scripts/download_weights.sh --sam2
+pass "Model weights ready (TennisCourtDetector + SAM2)"
 
 # --------------------------------------------------------------------------
 # 5. Download test videos
