@@ -1327,6 +1327,7 @@ def main() -> None:
             masker_kwargs["use_yolo"] = not args.sam2_no_yolo
             if args.sam2_checkpoint is not None:
                 masker_kwargs["checkpoint_path"] = args.sam2_checkpoint
+        logger.info("Loading occlusion masker '%s' (this may take a few minutes) ...", masker_name)
         masker = create_masker(
             masker_name,
             **masker_kwargs,
