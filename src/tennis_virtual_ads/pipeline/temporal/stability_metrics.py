@@ -53,20 +53,32 @@ class StabilityReport:
     rejected: int
     cuts: int
 
+    # Lock tracking.
+    lock_frames: int = 0
+    lock_ratio: float = 0.0
+    lock_transitions: int = 0
+
     def to_log_string(self) -> str:
         """Format as a multi-line log block."""
         accept_pct = 100.0 * self.accepted / max(self.total_frames, 1)
-        return (
-            "=== STABILITY REPORT ===\n"
+        lock_pct = 100.0 * self.lock_ratio
+        lines = [
+            "=== STABILITY REPORT ===",
             f"Reprojection:  mean={self.reproj_mean:.1f}px  "
-            f"p95={self.reproj_p95:.1f}px  max={self.reproj_max:.1f}px\n"
+            f"p95={self.reproj_p95:.1f}px  max={self.reproj_max:.1f}px",
             f"H-difference:  mean={self.hdiff_mean:.4f}  "
-            f"p95={self.hdiff_p95:.4f}  max={self.hdiff_max:.4f}\n"
+            f"p95={self.hdiff_p95:.4f}  max={self.hdiff_max:.4f}",
             f"Jitter(accel): mean={self.accel_mean:.1f}px  "
-            f"p95={self.accel_p95:.1f}px  max={self.accel_max:.1f}px\n"
+            f"p95={self.accel_p95:.1f}px  max={self.accel_max:.1f}px",
             f"Coverage:      accepted={self.accepted}/{self.total_frames} ({accept_pct:.1f}%)  "
-            f"held={self.held}  rejected={self.rejected}  cuts={self.cuts}"
-        )
+            f"held={self.held}  rejected={self.rejected}  cuts={self.cuts}",
+        ]
+        if self.lock_frames > 0 or self.lock_transitions > 0:
+            lines.append(
+                f"Lock:          locked={self.lock_frames}/{self.total_frames} ({lock_pct:.1f}%)  "
+                f"transitions={self.lock_transitions}"
+            )
+        return "\n".join(lines)
 
     def to_dict(self) -> dict[str, float | int]:
         """Serialise to a JSON-friendly dict."""
@@ -85,6 +97,9 @@ class StabilityReport:
             "held": self.held,
             "rejected": self.rejected,
             "cuts": self.cuts,
+            "lock_frames": self.lock_frames,
+            "lock_ratio": self.lock_ratio,
+            "lock_transitions": self.lock_transitions,
         }
 
 
@@ -116,6 +131,11 @@ class StabilityCollector:
     _rejected: int = field(default=0, init=False, repr=False)
     _cuts: int = field(default=0, init=False, repr=False)
 
+    _lock_frames: int = field(default=0, init=False, repr=False)
+    _unlock_frames: int = field(default=0, init=False, repr=False)
+    _lock_transitions: int = field(default=0, init=False, repr=False)
+    _prev_locked: bool = field(default=False, init=False, repr=False)
+
     def update(
         self,
         homography: np.ndarray | None,
@@ -124,6 +144,7 @@ class StabilityCollector:
         is_accepted: bool = False,
         is_held: bool = False,
         is_cut: bool = False,
+        is_locked: bool = False,
     ) -> None:
         """Record one frame's metrics.
 
@@ -140,6 +161,8 @@ class StabilityCollector:
             Whether a held last-good H was used.
         is_cut : bool
             Whether a scene cut was detected.
+        is_locked : bool
+            Whether the homography locker is currently locked.
         """
         self._total_frames += 1
 
@@ -152,6 +175,15 @@ class StabilityCollector:
             self._held += 1
         else:
             self._rejected += 1
+
+        # --- Lock tracking ---
+        if is_locked:
+            self._lock_frames += 1
+        else:
+            self._unlock_frames += 1
+        if is_locked != self._prev_locked and self._total_frames > 1:
+            self._lock_transitions += 1
+        self._prev_locked = is_locked
 
         # --- Reprojection error ---
         if reproj_error is not None:
@@ -213,6 +245,8 @@ class StabilityCollector:
         h_mean, h_p95, h_max = _stats(self._hdiff_norms)
         a_mean, a_p95, a_max = _stats(self._accel_magnitudes)
 
+        lock_ratio = self._lock_frames / max(self._total_frames, 1)
+
         return StabilityReport(
             reproj_mean=r_mean,
             reproj_p95=r_p95,
@@ -228,6 +262,9 @@ class StabilityCollector:
             held=self._held,
             rejected=self._rejected,
             cuts=self._cuts,
+            lock_frames=self._lock_frames,
+            lock_ratio=lock_ratio,
+            lock_transitions=self._lock_transitions,
         )
 
     def write_json(self, path: str | Path) -> None:

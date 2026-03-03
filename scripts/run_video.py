@@ -88,6 +88,8 @@ HSTAB_HUD_COLOR: tuple[int, int, int] = (0, 255, 128)  # Lime-green (BGR)
 HSTAB_HOLD_COLOR: tuple[int, int, int] = (0, 200, 255)  # Amber (BGR)
 CUT_HUD_COLOR: tuple[int, int, int] = (0, 0, 255)  # Red (BGR)
 BLEND_HUD_COLOR: tuple[int, int, int] = (200, 200, 0)  # Teal (BGR)
+HLOCK_LOCKED_COLOR: tuple[int, int, int] = (0, 255, 0)  # Green (BGR)
+HLOCK_UNLOCKED_COLOR: tuple[int, int, int] = (180, 180, 180)  # Gray (BGR)
 
 
 # ---------------------------------------------------------------------------
@@ -359,6 +361,28 @@ def overlay_cut_detected(
     overlay_text_with_outline(frame, text, position, font_scale, CUT_HUD_COLOR, thickness)
 
 
+def overlay_hlock_status(
+    frame: np.ndarray,
+    is_locked: bool,
+    frames_locked: int,
+    displacement: float,
+    hud_line_offset: int,
+) -> None:
+    """Draw H-lock status (HUD line).  Mutates *frame*."""
+    _frame_height, frame_width = frame.shape[:2]
+    font_scale, thickness, line_height = _compute_font_metrics(frame_width)
+    position = (10, line_height + int(font_scale * 30 * hud_line_offset))
+
+    if is_locked:
+        text = f"HLOCK=LOCKED ({frames_locked}f) disp={displacement:.2f}px"
+        color = HLOCK_LOCKED_COLOR
+    else:
+        text = f"HLOCK=UNLOCKED disp={displacement:.2f}px"
+        color = HLOCK_UNLOCKED_COLOR
+
+    overlay_text_with_outline(frame, text, position, font_scale, color, thickness)
+
+
 def overlay_blend_status(
     frame: np.ndarray,
     blend_mode: str,
@@ -472,6 +496,18 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
         )
 
     if name == "sam2":
+        checkpoint_path = kwargs.get("checkpoint_path") or "weights/sam2.1_hiera_small.pt"
+        if not Path(checkpoint_path).exists():
+            logger.error(
+                "SAM2 checkpoint not found: %s\n"
+                "Download it with:\n"
+                "  mkdir -p weights && wget -O weights/sam2.1_hiera_small.pt "
+                "https://dl.fbaipublicfiles.com/segment_anything_2/092824/"
+                "sam2.1_hiera_small.pt",
+                checkpoint_path,
+            )
+            sys.exit(1)
+
         from tennis_virtual_ads.pipeline.maskers.sam2_masker import SAM2Masker
 
         return SAM2Masker(
@@ -760,7 +796,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--mask_dilate_px",
         type=int,
         default=3,
-        help="Pixels to dilate the occlusion mask by (covers rackets near body; default: 3).",
+        help=(
+            "Pixels to dilate the occlusion mask by (covers rackets near body; default: 3). "
+            "Use 5-8 for Mask R-CNN to reduce halo artifacts."
+        ),
     )
     parser.add_argument(
         "--mask_debug",
@@ -853,6 +892,32 @@ def build_argument_parser() -> argparse.ArgumentParser:
             "time).  Pass 1 collects all homographies, pass 2 renders with "
             "globally smoothed H."
         ),
+    )
+
+    # --- Homography locking -----------------------------------------------
+    parser.add_argument(
+        "--lock_h",
+        action="store_true",
+        default=False,
+        help="Enable H locking: freeze homography when camera is static (zero jitter).",
+    )
+    parser.add_argument(
+        "--lock_threshold",
+        type=float,
+        default=0.5,
+        help="Mean displacement (px) below which a frame is considered static (default: 0.5).",
+    )
+    parser.add_argument(
+        "--unlock_threshold",
+        type=float,
+        default=2.0,
+        help="Mean displacement (px) above which a locked H is released (default: 2.0).",
+    )
+    parser.add_argument(
+        "--lock_patience",
+        type=int,
+        default=5,
+        help="Consecutive sub-threshold frames required before locking (default: 5).",
     )
 
     # --- SAM2 checkpoint --------------------------------------------------
@@ -1044,6 +1109,7 @@ def main() -> None:
     tracked_jitter_tracker: JitterTracker | None = None
     smoothed_jitter_tracker: JitterTracker | None = None
     stabilized_jitter_tracker: JitterTracker | None = None
+    locked_jitter_tracker: JitterTracker | None = None
 
     if jitter_tracker_enabled:
         from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
@@ -1057,6 +1123,8 @@ def main() -> None:
             smoothed_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         if stabilize_h_enabled:
             stabilized_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
+        if args.lock_h:
+            locked_jitter_tracker = JitterTracker(reference_points=_jitter_refer_kps.copy())
         jitter_labels = ["raw"]
         if track_keypoints_enabled:
             jitter_labels.append("tracked")
@@ -1064,6 +1132,8 @@ def main() -> None:
             jitter_labels.append("smoothed")
         if stabilize_h_enabled:
             jitter_labels.append("stabilized")
+        if args.lock_h:
+            jitter_labels.append("locked")
         logger.info("Jitter tracking enabled (%s)", " + ".join(jitter_labels))
 
     # --- Scene-cut detector (optional) ------------------------------------
@@ -1160,6 +1230,29 @@ def main() -> None:
         )
         logger.info("Stability metrics collection enabled")
 
+    # --- Homography locker (optional) -------------------------------------
+    lock_h_enabled: bool = args.lock_h and calibrator is not None
+    homography_locker = None
+
+    if lock_h_enabled:
+        from tennis_virtual_ads.pipeline.calibrators._tcd_adapted.homography import (
+            refer_kps as _lock_refer_kps,
+        )
+        from tennis_virtual_ads.pipeline.temporal.homography_locker import HomographyLocker
+
+        homography_locker = HomographyLocker(
+            reference_points=_lock_refer_kps.copy(),
+            lock_threshold=args.lock_threshold,
+            unlock_threshold=args.unlock_threshold,
+            lock_patience=args.lock_patience,
+        )
+        logger.info(
+            "H-locking enabled: lock_thresh=%.2fpx  unlock_thresh=%.2fpx  patience=%d",
+            args.lock_threshold,
+            args.unlock_threshold,
+            args.lock_patience,
+        )
+
     # --- Ad placement (optional) ------------------------------------------
     ad_config: dict[str, Any] = config.get("ad", {})
     ad_enabled: bool = args.ad_enable or ad_config.get("enabled", False)
@@ -1233,6 +1326,13 @@ def main() -> None:
             mask_debug,
         )
 
+    if ad_enabled and masker_name == "none":
+        logger.warning(
+            "Ad placement is enabled but no occlusion masker is active. "
+            "Players will NOT be properly occluded. "
+            "Consider --masker mrcnn or --masker sam2."
+        )
+
     # --- Blend mode (painted compositing, optional) -----------------------
     blend_mode: str = args.blend_mode
     blend_debug: bool = args.blend_debug
@@ -1285,7 +1385,7 @@ def main() -> None:
         "Settings -- start_frame=%d  max_frames=%s  stride=%d  resize=%s  "
         "calibrator=%s  draw_mode=%s  conf_threshold=%.2f  smooth=%s  "
         "track_kps=%s  stabilize_h=%s  h_filter=%s  lookahead=%s  two_pass=%s  "
-        "cut_detect=%s  jitter_track=%s  ad=%s  masker=%s  blend=%s",
+        "lock_h=%s  cut_detect=%s  jitter_track=%s  ad=%s  masker=%s  blend=%s",
         start_frame,
         max_frames,
         stride,
@@ -1299,6 +1399,7 @@ def main() -> None:
         args.h_filter,
         lookahead_n if lookahead_enabled else "off",
         two_pass_enabled,
+        lock_h_enabled,
         cut_detection_enabled,
         jitter_tracker_enabled,
         ad_enabled,
@@ -1365,6 +1466,8 @@ def main() -> None:
                 frame: np.ndarray,
                 final_H: np.ndarray | None,
                 state: _FrameState,
+                *,
+                is_h_locked: bool = False,
             ) -> None:
                 """Render overlays, ads, HUD onto *frame* and write it."""
                 has_usable_homography = final_H is not None
@@ -1377,6 +1480,7 @@ def main() -> None:
                         is_accepted=state.is_accepted,
                         is_held=state.stabilizer_is_holding,
                         is_cut=state.is_cut,
+                        is_locked=is_h_locked,
                     )
                     if state.is_cut:
                         stability_collector.reset_temporal()
@@ -1472,6 +1576,16 @@ def main() -> None:
                     )
                     next_hud_line += 1
 
+                if homography_locker is not None:
+                    overlay_hlock_status(
+                        frame,
+                        is_h_locked,
+                        homography_locker.frames_locked if is_h_locked else 0,
+                        homography_locker.last_displacement,
+                        next_hud_line,
+                    )
+                    next_hud_line += 1
+
                 if ad_placer is not None:
                     overlay_ad_status(frame, ad_anchor_name, smooth_enabled, next_hud_line)
                     next_hud_line += 1
@@ -1498,6 +1612,29 @@ def main() -> None:
                     overlay_shade_debug(frame, blend_debug_payload["shade_map"])
 
                 writer.write(frame)
+
+            # ==============================================================
+            # H-lock helper (eliminates duplication across 3 modes)
+            # ==============================================================
+            def _apply_h_lock(
+                h: np.ndarray | None,
+                state: _FrameState,
+            ) -> tuple[np.ndarray | None, bool]:
+                """Apply H locking + locked jitter tracking.
+
+                Returns ``(final_H, is_locked)``.  Safe to call when locker
+                is disabled -- returns ``(h, False)`` unchanged.
+                """
+                if homography_locker is None:
+                    return h, False
+                if state.is_cut:
+                    homography_locker.reset()
+                    if locked_jitter_tracker is not None:
+                        locked_jitter_tracker.reset()
+                h = homography_locker.update(h)
+                if locked_jitter_tracker is not None and h is not None:
+                    locked_jitter_tracker.update(h)
+                return h, homography_locker.is_locked
 
             # ==============================================================
             # Per-frame H computation (calibration → tracking → smoothing
@@ -1562,6 +1699,9 @@ def main() -> None:
                             smoothed_jitter_tracker.reset()
                         if stabilized_jitter_tracker is not None:
                             stabilized_jitter_tracker.reset()
+                        # Locker + locked jitter tracker resets are deferred
+                        # to _apply_h_lock (called at render time) so that
+                        # buffered frames render correctly -- same as masker.
                         # Masker reset is deferred to _render_frame so
                         # that buffered frames render correctly.
 
@@ -1699,7 +1839,8 @@ def main() -> None:
                         # Fall back to pre-smooth H if smoother returned None.
                         if final_H is None:
                             final_H = st.homography_for_drawing
-                        _render_frame(frame, final_H, st)
+                        final_H, _is_locked = _apply_h_lock(final_H, st)
+                        _render_frame(frame, final_H, st, is_h_locked=_is_locked)
 
                         if writer.frames_written % 100 == 0:
                             elapsed = time.perf_counter() - pass2_start
@@ -1730,7 +1871,8 @@ def main() -> None:
 
                     if smoothed_H is not None:
                         buf_frame, buf_state = frame_buffer.popleft()
-                        _render_frame(buf_frame, smoothed_H, buf_state)
+                        smoothed_H, _is_locked = _apply_h_lock(smoothed_H, buf_state)
+                        _render_frame(buf_frame, smoothed_H, buf_state, is_h_locked=_is_locked)
 
                     total_processed = accepted_count + rejected_count
                     if total_processed > 0 and total_processed % 100 == 0:
@@ -1755,7 +1897,8 @@ def main() -> None:
                         if smoothed_H_flush is not None
                         else buf_state.homography_for_drawing
                     )
-                    _render_frame(buf_frame, final_H, buf_state)
+                    final_H, _is_locked = _apply_h_lock(final_H, buf_state)
+                    _render_frame(buf_frame, final_H, buf_state, is_h_locked=_is_locked)
 
             else:
                 # --- NORMAL MODE (immediate rendering) --------------------
@@ -1768,7 +1911,8 @@ def main() -> None:
                     if not (state.is_accepted or state.stabilizer_is_holding):
                         final_H = None
 
-                    _render_frame(frame, final_H, state)
+                    final_H, _is_locked = _apply_h_lock(final_H, state)
+                    _render_frame(frame, final_H, state, is_h_locked=_is_locked)
 
                     if writer.frames_written % 100 == 0:
                         elapsed = time.perf_counter() - wall_clock_start
@@ -1845,6 +1989,13 @@ def main() -> None:
             logger.info("Jitter (stabilized H) -- %s", stab_summary.to_log_string())
         else:
             logger.info("Jitter (stabilized H) -- not enough frames to compute")
+
+    if locked_jitter_tracker is not None:
+        locked_summary = locked_jitter_tracker.get_summary()
+        if locked_summary is not None:
+            logger.info("Jitter (locked H)     -- %s", locked_summary.to_log_string())
+        else:
+            logger.info("Jitter (locked H)     -- not enough frames to compute")
 
 
 if __name__ == "__main__":
