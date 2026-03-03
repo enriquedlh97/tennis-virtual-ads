@@ -112,6 +112,29 @@ class SAM2Masker(OcclusionMasker):
 
         import torch
 
+        # SAM2 logs "Computing image embeddings..." on every frame via the
+        # root logger.  Suppress to WARNING to avoid flooding the console.
+        logging.getLogger("root").setLevel(logging.WARNING)
+        # Also silence the unnamed root logger that SAM2 uses directly.
+        _root = logging.getLogger()
+        if _root.level < logging.WARNING:
+            # Add a filter instead of changing the root level (which would
+            # suppress our own logs).  Filter out the known noisy messages.
+            _sam2_suppressed = frozenset(
+                {
+                    "Computing image embeddings for the provided image...",
+                    "Image embeddings computed.",
+                    "For numpy array image, we assume (HxWxC) format",
+                    "Loaded checkpoint sucessfully",
+                }
+            )
+
+            class _SAM2LogFilter(logging.Filter):
+                def filter(self, record: logging.LogRecord) -> bool:
+                    return record.getMessage() not in _sam2_suppressed
+
+            _root.addFilter(_SAM2LogFilter())
+
         self._confidence_threshold = confidence_threshold
         self._reprompt_interval = reprompt_interval
         self._offload_to_cpu = offload_to_cpu
