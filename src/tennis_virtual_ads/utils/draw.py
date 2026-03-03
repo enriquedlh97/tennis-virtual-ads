@@ -56,12 +56,15 @@ def project_point(homography: np.ndarray, point: tuple[int, int]) -> tuple[int, 
         Projected ``(x, y)`` in the target coordinate system, or ``None``
         if the point projects to infinity (``w ~ 0``).
     """
+    H = np.asarray(homography, dtype=np.float64).reshape(3, 3)
     point_homogeneous = np.array([point[0], point[1], 1.0], dtype=np.float64)
-    projected = homography @ point_homogeneous
-    if abs(projected[2]) < 1e-10:
+    projected = H @ point_homogeneous
+    w = projected[2]
+    if abs(w) < 1e-10:
         return None
-    projected /= projected[2]
-    return (round(float(projected[0])), round(float(projected[1])))
+    x = projected[0] / w
+    y = projected[1] / w
+    return (int(np.round(x)), int(np.round(y)))
 
 
 # ---------------------------------------------------------------------------
