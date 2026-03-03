@@ -9,4 +9,7 @@ from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker, OcclusionM
 # SAM2Masker requires sam2 + torch (heavy optional dependency).  Import explicitly:
 #   from tennis_virtual_ads.pipeline.maskers.sam2_masker import SAM2Masker
 
+# YOLOSegMasker requires ultralytics (optional dependency).  Import explicitly:
+#   from tennis_virtual_ads.pipeline.maskers.yolo_seg_masker import YOLOSegMasker
+
 __all__ = ["OcclusionMasker", "OcclusionMaskerResult"]
