@@ -479,7 +479,7 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 # Masker factory
 # ---------------------------------------------------------------------------
 
-MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg"]
+MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key"]
 
 
 def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
@@ -526,6 +526,19 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             model_name=kwargs.get("model_name", "yolo11m-seg.pt"),
             confidence_threshold=kwargs.get("confidence_threshold", 0.5),
             device=kwargs.get("device"),
+        )
+
+    if name == "color_key":
+        from tennis_virtual_ads.pipeline.maskers.color_key_masker import ColorKeyMasker
+
+        return ColorKeyMasker(
+            preset=kwargs.get("preset", "blue_hard"),
+            h_low=kwargs.get("h_low"),
+            h_high=kwargs.get("h_high"),
+            s_low=kwargs.get("s_low"),
+            s_high=kwargs.get("s_high"),
+            v_low=kwargs.get("v_low"),
+            v_high=kwargs.get("v_high"),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -840,6 +853,27 @@ def build_argument_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Disable YOLO for SAM2 prompting (use Mask R-CNN fallback instead).",
+    )
+
+    # --- Color-key masker -------------------------------------------------
+    parser.add_argument(
+        "--court_color_preset",
+        type=str,
+        default="blue_hard",
+        choices=["blue_hard", "green_hard", "clay"],
+        help="Court color preset for color_key masker (default: blue_hard).",
+    )
+    parser.add_argument("--court_h_low", type=int, default=None, help="HSV H lower bound override.")
+    parser.add_argument(
+        "--court_h_high", type=int, default=None, help="HSV H upper bound override."
+    )
+    parser.add_argument("--court_s_low", type=int, default=None, help="HSV S lower bound override.")
+    parser.add_argument(
+        "--court_s_high", type=int, default=None, help="HSV S upper bound override."
+    )
+    parser.add_argument("--court_v_low", type=int, default=None, help="HSV V lower bound override.")
+    parser.add_argument(
+        "--court_v_high", type=int, default=None, help="HSV V upper bound override."
     )
 
     # --- Compositing / blend mode -----------------------------------------
@@ -1338,7 +1372,16 @@ def main() -> None:
                 masker_kwargs["checkpoint_path"] = args.sam2_checkpoint
         elif masker_name == "yolo_seg":
             masker_kwargs["model_name"] = args.yolo_seg_model
-        logger.info("Loading occlusion masker '%s' (this may take a few minutes) ...", masker_name)
+        elif masker_name == "color_key":
+            masker_kwargs.pop("confidence_threshold", None)
+            masker_kwargs["preset"] = args.court_color_preset
+            masker_kwargs["h_low"] = args.court_h_low
+            masker_kwargs["h_high"] = args.court_h_high
+            masker_kwargs["s_low"] = args.court_s_low
+            masker_kwargs["s_high"] = args.court_s_high
+            masker_kwargs["v_low"] = args.court_v_low
+            masker_kwargs["v_high"] = args.court_v_high
+        logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,
             **masker_kwargs,

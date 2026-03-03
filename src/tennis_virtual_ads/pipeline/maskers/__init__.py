@@ -12,4 +12,7 @@ from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker, OcclusionM
 # YOLOSegMasker requires ultralytics (optional dependency).  Import explicitly:
 #   from tennis_virtual_ads.pipeline.maskers.yolo_seg_masker import YOLOSegMasker
 
+# ColorKeyMasker is pure OpenCV (no extra deps).  Import explicitly:
+#   from tennis_virtual_ads.pipeline.maskers.color_key_masker import ColorKeyMasker
+
 __all__ = ["OcclusionMasker", "OcclusionMaskerResult"]
