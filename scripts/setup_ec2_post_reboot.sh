@@ -85,7 +85,7 @@ info "5/8  Downloading test videos"
 
 VIDEOS_ZIP="assets/videos.zip"
 VIDEOS_DIR="assets/videos"
-VIDEOS_GDRIVE_ID="1MZtx5Id6UWDgVRbgboLp2BiwCk2uCLdF"
+VIDEOS_GDRIVE_ID="1tawxvTSqW4It6nDYQ7c0_6zSjBBSzZY7"
 
 if [ -d "$VIDEOS_DIR" ] && [ "$(ls -A "$VIDEOS_DIR" 2>/dev/null)" ]; then
     echo "  Test videos already exist in $VIDEOS_DIR — skipping download"
