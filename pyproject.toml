@@ -42,6 +42,10 @@ matanyone = [
     #   uv pip install --no-deps git+https://github.com/pq-yang/MatAnyone.git
     # (its transitive dep cchardet fails to build on Python 3.12)
 ]
+depth = [
+    "torch>=2.0",
+    "transformers>=4.40",
+]
 guided_filter = [
     "opencv-contrib-python>=4.8.0",
 ]

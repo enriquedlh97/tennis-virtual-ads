@@ -21,4 +21,10 @@ from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker, OcclusionM
 # MatAnyoneMasker requires matanyone + torch (heavy optional dependency).  Import explicitly:
 #   from tennis_virtual_ads.pipeline.maskers.matanyone_masker import MatAnyoneMasker
 
+# DepthMasker requires torch + transformers (heavy optional dependency).  Import explicitly:
+#   from tennis_virtual_ads.pipeline.maskers.depth_masker import DepthMasker
+
+# MatAnyoneHybridMasker requires matanyone + torch (heavy optional dependency).  Import explicitly:
+#   from tennis_virtual_ads.pipeline.maskers.matanyone_hybrid_masker import MatAnyoneHybridMasker
+
 __all__ = ["OcclusionMasker", "OcclusionMaskerResult"]

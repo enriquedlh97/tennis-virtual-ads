@@ -36,11 +36,11 @@ import numpy as np
 from tennis_virtual_ads.pipeline.maskers.base import OcclusionMasker, OcclusionMaskerResult
 
 try:
-    from cv2 import ximgproc as _ximgproc  # type: ignore[attr-defined]
+    from cv2 import ximgproc as _ximgproc
 
     _HAS_GUIDED_FILTER = True
 except ImportError:
-    _ximgproc = None
+    _ximgproc = None  # type: ignore[assignment]
     _HAS_GUIDED_FILTER = False
 
 logger = logging.getLogger(__name__)

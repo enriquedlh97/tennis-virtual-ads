@@ -233,7 +233,7 @@ class MatAnyoneMasker(OcclusionMasker):
         mask_tensor = torch.from_numpy(binary_mask).float().to(self._device)
 
         # Optionally resize for VRAM savings.
-        image_tensor, mask_tensor, scale = self._maybe_resize(image_tensor, mask_tensor)
+        image_tensor, mask_tensor, scale = self._maybe_resize(image_tensor, mask_tensor)  # type: ignore[assignment]
 
         # --- Initialize MatAnyone --------------------------------------------
         self._processor.clear_memory()

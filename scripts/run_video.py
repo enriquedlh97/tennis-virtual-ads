@@ -479,7 +479,17 @@ def create_calibrator(name: str, **kwargs: Any) -> CourtCalibrator:
 # Masker factory
 # ---------------------------------------------------------------------------
 
-MASKER_NAMES: list[str] = ["none", "person", "sam2", "yolo_seg", "color_key", "rvm", "matanyone"]
+MASKER_NAMES: list[str] = [
+    "none",
+    "person",
+    "sam2",
+    "yolo_seg",
+    "color_key",
+    "rvm",
+    "matanyone",
+    "depth",
+    "matanyone_hybrid",
+]
 
 
 def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
@@ -565,6 +575,34 @@ def create_masker(name: str, **kwargs: Any) -> OcclusionMasker:
             checkpoint_path=kwargs.get("checkpoint_path"),
             max_internal_size=kwargs.get("max_internal_size", -1),
             box_padding=kwargs.get("box_padding", 10),
+        )
+
+    if name == "depth":
+        from tennis_virtual_ads.pipeline.maskers.depth_masker import DepthMasker
+
+        return DepthMasker(
+            model_size=kwargs.get("model_size", "small"),
+            device=kwargs.get("device"),
+            court_depth_percentile=kwargs.get("court_depth_percentile", 70.0),
+            foreground_offset=kwargs.get("foreground_offset", 0.05),
+            softness=kwargs.get("softness", 0.02),
+        )
+
+    if name == "matanyone_hybrid":
+        from tennis_virtual_ads.pipeline.maskers.matanyone_hybrid_masker import (
+            MatAnyoneHybridMasker,
+        )
+
+        return MatAnyoneHybridMasker(
+            device=kwargs.get("device"),
+            confidence_threshold=kwargs.get("confidence_threshold", 0.5),
+            keyframe_interval=kwargs.get("keyframe_interval", 15),
+            n_warmup=kwargs.get("n_warmup", 5),
+            use_yolo=kwargs.get("use_yolo", True),
+            checkpoint_path=kwargs.get("checkpoint_path"),
+            max_internal_size=kwargs.get("max_internal_size", -1),
+            box_padding=kwargs.get("box_padding", 10),
+            flow_scale=kwargs.get("flow_scale", 0.5),
         )
 
     valid_names = ", ".join(sorted(MASKER_NAMES))
@@ -970,6 +1008,47 @@ def build_argument_parser() -> argparse.ArgumentParser:
         type=int,
         default=10,
         help="MatAnyone: padding on detection boxes for initial mask (default: 10).",
+    )
+
+    # --- Depth masker -----------------------------------------------------
+    parser.add_argument(
+        "--depth_model_size",
+        type=str,
+        choices=["small", "base", "large"],
+        default="small",
+        help="Depth Anything V2 model size (default: small).",
+    )
+    parser.add_argument(
+        "--depth_court_percentile",
+        type=float,
+        default=70.0,
+        help="Depth masker: percentile of depth values for court plane estimate (default: 70).",
+    )
+    parser.add_argument(
+        "--depth_foreground_offset",
+        type=float,
+        default=0.05,
+        help="Depth masker: offset above court depth to count as foreground (default: 0.05).",
+    )
+    parser.add_argument(
+        "--depth_softness",
+        type=float,
+        default=0.02,
+        help="Depth masker: sigmoid soft transition width (0 = hard; default: 0.02).",
+    )
+
+    # --- MatAnyone hybrid masker ------------------------------------------
+    parser.add_argument(
+        "--hybrid_keyframe_interval",
+        type=int,
+        default=15,
+        help="Hybrid masker: run MatAnyone every N frames (default: 15).",
+    )
+    parser.add_argument(
+        "--hybrid_flow_scale",
+        type=float,
+        default=0.5,
+        help="Hybrid masker: compute optical flow at this fraction of full res (default: 0.5).",
     )
 
     # --- Compositing / blend mode -----------------------------------------
@@ -1492,6 +1571,21 @@ def main() -> None:
             masker_kwargs["box_padding"] = args.matanyone_box_padding
             if args.matanyone_checkpoint is not None:
                 masker_kwargs["checkpoint_path"] = args.matanyone_checkpoint
+        elif masker_name == "depth":
+            masker_kwargs.pop("confidence_threshold", None)
+            masker_kwargs["model_size"] = args.depth_model_size
+            masker_kwargs["court_depth_percentile"] = args.depth_court_percentile
+            masker_kwargs["foreground_offset"] = args.depth_foreground_offset
+            masker_kwargs["softness"] = args.depth_softness
+        elif masker_name == "matanyone_hybrid":
+            masker_kwargs["keyframe_interval"] = args.hybrid_keyframe_interval
+            masker_kwargs["flow_scale"] = args.hybrid_flow_scale
+            masker_kwargs["n_warmup"] = args.matanyone_n_warmup
+            masker_kwargs["use_yolo"] = not args.matanyone_no_yolo
+            masker_kwargs["max_internal_size"] = args.matanyone_max_size
+            masker_kwargs["box_padding"] = args.matanyone_box_padding
+            if args.matanyone_checkpoint is not None:
+                masker_kwargs["checkpoint_path"] = args.matanyone_checkpoint
         logger.info("Loading occlusion masker '%s' ...", masker_name)
         masker = create_masker(
             masker_name,
@@ -1508,7 +1602,10 @@ def main() -> None:
     mask_smoother: MaskSmoother | None = None
     if masker_enabled:
         effective_close_px = args.mask_close_px
-        if masker_name in ("matanyone", "rvm") and effective_close_px == 7:
+        if (
+            masker_name in ("matanyone", "rvm", "depth", "matanyone_hybrid")
+            and effective_close_px == 7
+        ):
             effective_close_px = 0
             logger.info(
                 "MaskSmoother auto-disabled for '%s' (soft alpha). "

@@ -188,7 +188,7 @@ class SAM2Masker(OcclusionMasker):
         self._mrcnn_transforms: Any = None
 
         if self._use_yolo:
-            from ultralytics import YOLO
+            from ultralytics import YOLO  # type: ignore[attr-defined]
 
             logger.info("Loading YOLO '%s' for SAM2 prompting ...", yolo_model)
             self._yolo_model_obj = YOLO(yolo_model)

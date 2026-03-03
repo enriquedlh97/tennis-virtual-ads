@@ -66,7 +66,7 @@ class YOLOSegMasker(OcclusionMasker):
     ) -> None:
         _check_dependencies()
 
-        from ultralytics import YOLO
+        from ultralytics import YOLO  # type: ignore[attr-defined]
 
         self._confidence_threshold = confidence_threshold
 

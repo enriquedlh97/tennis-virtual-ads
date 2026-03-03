@@ -87,7 +87,7 @@ class RVMMasker(OcclusionMasker):
         )
         load_start = time.perf_counter()
 
-        self._model = torch.hub.load(
+        self._model = torch.hub.load(  # type: ignore[no-untyped-call]
             "PeterL1n/RobustVideoMatting",
             backbone,
             trust_repo=True,

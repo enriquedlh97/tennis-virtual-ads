@@ -59,7 +59,7 @@ def load_yolo(model_name: str = "yolo11n.pt") -> Any:
     YOLO
         An ``ultralytics.YOLO`` model instance.
     """
-    from ultralytics import YOLO
+    from ultralytics import YOLO  # type: ignore[attr-defined]
 
     logger.info("Loading YOLO '%s' for person detection ...", model_name)
     model = YOLO(model_name)
